@@ -1,7 +1,7 @@
 import numpy as np
 from itertools import combinations
 from typing import Dict, Tuple
-from src.preprocessing.audio_feature_extraction import extract_stem_feature
+from src.latent_preprocessing.audio_feature_extraction import extract_stem_feature
 
 
 HARMONY_WEIGHTS = {

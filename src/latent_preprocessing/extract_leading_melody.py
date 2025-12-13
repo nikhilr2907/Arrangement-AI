@@ -43,4 +43,4 @@ def find_leading_melody_feature(audio_clip, sr=22050):
 
 def is_leading_melody(audio_clips):
     """Return clip with strongest melody."""
-    return max(audio_clips, key=find_leading_melody_feature)
+    return max(audio_clips, key=lambda clip: find_leading_melody_feature(clip[0], clip[1]))

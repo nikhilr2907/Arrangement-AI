@@ -14,5 +14,5 @@ def extract_stem_feature(audio_clip, sr=22050):
         "rolloff":            librosa.feature.spectral_rolloff(y=audio_clip, sr=sr).mean(),
         "onset_strength":     librosa.onset.onset_strength(y=audio_clip, sr=sr).mean(),
         "zcr":                librosa.feature.zero_crossing_rate(y=audio_clip).mean(),
-        "key_signature":      librosa.key_signature(audio_clip),
+
     }

@@ -50,10 +50,6 @@ class MusicalTransformer(nn.Module):
     
     def train_step_tf(self, src, tgt, criterion, optimizer):
         """Teacher Forcing: Use ground truth at each step
-
-        Args:
-            src: Context tokens (batch, src_len)
-            tgt: Target tokens to predict (batch, tgt_len)
         """
         self.train()
         optimizer.zero_grad()

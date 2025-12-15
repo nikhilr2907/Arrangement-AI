@@ -1,5 +1,5 @@
 from itertools import combinations
-from typing import Dict, List, Tuple
+from typing import dict, list, tuple
 
 import librosa
 import numpy as np

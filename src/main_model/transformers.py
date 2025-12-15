@@ -1,130 +1,185 @@
+"""
+Basic transformer for next-token prediction with essential variable-length support.
+"""
+
 import torch
 from torch import nn
-import random
-
-
+from typing import Optional
 
 
 class MusicalTransformer(nn.Module):
-    def __init__(self, vocab_size, model_dim, num_heads, num_layers, max_seq_len=120):
-        super(MusicalTransformer, self).__init__()
-        # For tokenized inputs: vocab_size = number of unique tokens
-        self.embedding = nn.Embedding(vocab_size, model_dim)
-        self.positional_encoding = nn.Parameter(torch.randn(max_seq_len, model_dim))
+    """Basic transformer for next-token prediction with variable-length sequences."""
 
-        decoder_layer = nn.TransformerDecoderLayer(d_model=model_dim, nhead=num_heads, batch_first=True)
+    def __init__(
+        self,
+        vocab_size: int,
+        model_dim: int = 256,
+        num_heads: int = 8,
+        num_layers: int = 4,
+        max_seq_len: int = 512,
+        dropout: float = 0.1,
+        pad_idx: int = 0,
+    ):
+        """
+        Args:
+            vocab_size: Total vocabulary size (including PAD token)
+            model_dim: Model dimension
+            num_heads: Number of attention heads
+            num_layers: Number of transformer layers
+            max_seq_len: Maximum sequence length
+            dropout: Dropout rate
+            pad_idx: Padding token index (default: 0)
+        """
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.model_dim = model_dim
+        self.max_seq_len = max_seq_len
+        self.pad_idx = pad_idx
+
+        # Token embedding (padding_idx zeros out padding tokens)
+        self.embedding = nn.Embedding(vocab_size, model_dim, padding_idx=pad_idx)
+
+        # Positional encoding (learnable)
+        self.positional_encoding = nn.Embedding(max_seq_len, model_dim)
+
+        # Transformer decoder
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=model_dim,
+            nhead=num_heads,
+            dim_feedforward=model_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        # Project back to vocabulary for next-token prediction
+        # Output projection to vocabulary
         self.output_linear = nn.Linear(model_dim, vocab_size)
-        self.max_seq_len = max_seq_len
 
-    def forward(self, src, tgt):
-        # src and tgt are token IDs: (batch, src_len) and (batch, tgt_len)
-        # Concatenate along sequence dimension
-        combined = torch.cat([src, tgt], dim=1)  # Shape: (batch, src_len + tgt_len)
-        # Embed tokens and add positional encoding
-        embedded = self.embedding(combined)  # Shape: (batch, seq_len, model_dim)
-        seq_len = embedded.size(1)
-        embedded = embedded + self.positional_encoding[:seq_len, :]
-        # Create causal mask (prevents attending to future tokens)
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=embedded.device)
-        # For decoder-only, we use the embedded sequence as both input and memory
-        output = self.transformer_decoder(embedded, embedded, tgt_mask=causal_mask)
-        # Project back to output dimension
-        output = self.output_linear(output)
+        self.dropout = nn.Dropout(dropout)
 
-        return output
-
-    def autoregressive_generate(self, src, max_length):
-        # src: (batch, src_len)
-        generated = src
-
-        for _ in range(max_length):
-            output = self.forward(generated, generated)
-            next_token_logits = output[:, -1, :]  # Get logits for the last time step
-            next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)  # Greedy decoding
-            generated = torch.cat([generated, next_tokens], dim=1)
-
-        return generated
-    
-    def train_step_tf(self, src, tgt, criterion, optimizer):
-        """Teacher Forcing: Use ground truth at each step
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        self.train()
-        optimizer.zero_grad()
-
-        # Predict all positions using ground truth input
-        output = self.forward(src, tgt[:, :-1])  # Input all but last token
-        # output shape: (batch, src_len + tgt_len - 1, vocab_size)
-
-        # We only compute loss on the tgt portion
-        # Take predictions for positions corresponding to tgt
-        tgt_predictions = output[:, -tgt.size(1)+1:, :]  # (batch, tgt_len-1, vocab_size)
-
-        # Compare with actual next tokens
-        loss = criterion(
-            tgt_predictions.reshape(-1, tgt_predictions.size(-1)),  # (batch*(tgt_len-1), vocab_size)
-            tgt[:, 1:].reshape(-1)  # (batch*(tgt_len-1),)
-        )
-
-        loss.backward()
-        optimizer.step()
-        return loss.item()
-
-    def train_step_scheduled_sampling(self, src, tgt, criterion, optimizer, sampling_prob=0.5):
-        """Scheduled Sampling: Mix teacher forcing and autoregressive generation
-
-        At each step, use ground truth with probability (1 - sampling_prob),
-        or use model's own prediction with probability sampling_prob.
+        Forward pass.
 
         Args:
-            src: Context tokens (batch, src_len)
-            tgt: Target tokens (batch, tgt_len)
-            sampling_prob: Probability of using model's prediction (0=pure teacher forcing, 1=pure autoregressive)
+            input_ids: (batch, seq_len) - token indices
+            attention_mask: (batch, seq_len) - 1 for real tokens, 0 for padding
+
+        Returns:
+            logits: (batch, seq_len, vocab_size)
         """
-        self.train()
-        optimizer.zero_grad()
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
 
-        tgt_len = tgt.size(1)
+        # Create position indices
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
-        # Start with src
-        current_input_src = src
-        current_input_tgt = tgt[:, :1]  # First token of target
+        # Embed tokens and add positional encoding
+        token_embeds = self.embedding(input_ids)
+        pos_embeds = self.positional_encoding(positions)
+        embedded = self.dropout(token_embeds + pos_embeds)
 
-        all_logits = []
-
-        for i in range(1, tgt_len):
-            # Get predictions
-            output = self.forward(current_input_src, current_input_tgt)
-            next_logits = output[:, -1:, :]  # Last position logits: (batch, 1, vocab_size)
-            all_logits.append(next_logits)
-
-            # Decide: use ground truth or model prediction?
-            if torch.rand(1).item() > sampling_prob:
-                # Use ground truth (teacher forcing)
-                next_token = tgt[:, i:i+1]
-            else:
-                # Use model's prediction
-                next_token = torch.argmax(next_logits, dim=-1)  # (batch, 1)
-
-            # Append to input for next step
-            current_input_tgt = torch.cat([current_input_tgt, next_token], dim=1)
-
-        # Compute loss
-        all_logits = torch.cat(all_logits, dim=1)  # (batch, tgt_len-1, vocab_size)
-        loss = criterion(
-            all_logits.reshape(-1, all_logits.size(-1)),
-            tgt[:, 1:].reshape(-1)
+        # Create causal mask (prevents attending to future positions)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            seq_len, device=device
         )
 
-        loss.backward()
-        optimizer.step()
-        return loss.item()
-    
-    def inference_testing(self, src, max_length):
-        """Generate sequence given src context for testing/inference."""
+        # Create padding mask (True = masked/ignored)
+        if attention_mask is None:
+            padding_mask = (input_ids == self.pad_idx)
+        else:
+            padding_mask = ~attention_mask.bool()
+
+        # Transformer forward pass
+        output = self.transformer_decoder(
+            embedded,
+            embedded,
+            tgt_mask=causal_mask,
+            tgt_key_padding_mask=padding_mask,
+        )
+
+        # Project to vocabulary
+        logits = self.output_linear(output)
+
+        return logits
+
+    def compute_loss(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute cross-entropy loss for next-token prediction.
+
+        Args:
+            input_ids: (batch, seq_len) - input sequence
+            attention_mask: (batch, seq_len) - mask for valid positions
+        """
+        logits = self.forward(input_ids, attention_mask)
+
+        # Shift for next-token prediction
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+
+        # Mask padding in labels
+        if attention_mask is not None:
+            shift_mask = attention_mask[:, 1:].contiguous()
+            shift_labels = shift_labels.masked_fill(~shift_mask.bool(), -100)
+        else:
+            shift_labels = shift_labels.masked_fill(
+                shift_labels == self.pad_idx, -100
+            )
+
+        # Compute loss (ignore_index=-100 skips padding)
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+        loss = loss_fct(
+            shift_logits.view(-1, self.vocab_size),
+            shift_labels.view(-1),
+        )
+
+        return loss
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_length: int,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Autoregressive generation.
+
+        Args:
+            input_ids: (batch, seq_len) - context tokens
+            max_length: Maximum number of new tokens to generate
+            temperature: Sampling temperature (higher = more random)
+
+        Returns:
+            generated: (batch, seq_len + generated_length)
+        """
         self.eval()
-        with torch.no_grad():
-            generated = self.autoregressive_generate(src, max_length)
+        generated = input_ids.clone()
+
+        for _ in range(max_length):
+            if generated.size(1) >= self.max_seq_len:
+                break
+
+            # Get logits for all positions
+            logits = self.forward(generated)
+
+            # Get logits for last position only
+            next_token_logits = logits[:, -1, :] / temperature
+
+            # Sample next token
+            probs = torch.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            # Append to sequence
+            generated = torch.cat([generated, next_token], dim=1)
+
         return generated

@@ -1,6 +1,4 @@
 from itertools import combinations
-from typing import dict, list, tuple
-
 import librosa
 import numpy as np
 from numpy.typing import NDArray
@@ -59,7 +57,7 @@ def find_leading_melody_feature(audio_clip: NDArray[np.float32], sr: int = 22050
 
 
 def compute_group_compatibility(
-    waveforms: List[NDArray[np.float32]], sr: int = 22050
+    waveforms: list[NDArray[np.float32]], sr: int = 22050
 ) -> float:
     """
     Check harmonic compatibility between multiple waveforms.
@@ -80,26 +78,26 @@ def compute_group_compatibility(
     return np.mean(correlations) if correlations else 0.0
 
 
-AudioClip = Tuple[NDArray[np.float32], int]
+AudioClip = tuple[NDArray[np.float32], int]
 
 
 def is_leading_melody(
-    audio_clips: Dict[str, AudioClip],
+    audio_clips: dict[str, AudioClip],
     max_group_size: int = 3,
     compatibility_threshold: float = 0.3,
-) -> Dict[str, AudioClip]:
+) -> dict[str, AudioClip]:
     """
     Return the leading melody group (1-3 clips) with filename tracking.
 
     Args:
-        audio_clips: Dictionary mapping filename to (audio_array, sample_rate) tuples
+        audio_clips: dictionary mapping filename to (audio_array, sample_rate) tuples
         max_group_size: Maximum number of clips in a group
         compatibility_threshold: Minimum compatibility score for grouping
 
     Returns:
-        Dictionary mapping filename to (audio_array, sample_rate) for leading melody group
+        dictionary mapping filename to (audio_array, sample_rate) for leading melody group
     """
-    if not audio_clips:
+    if len(audio_clips) == 0:
         return {}
 
     if len(audio_clips) == 1:

@@ -1,8 +1,10 @@
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
-
+from typing import Dict, List,Tuple
+import os
 import librosa
 import numpy as np
+
 
 from src.latent_preprocessing.melodic_candidates import find_melodic_candidates
 from src.latent_preprocessing.extract_leading_melody import is_leading_melody
@@ -15,13 +17,13 @@ def process_audio_stems(stems: List[str]) -> Dict[str, np.ndarray]:
     Process audio stems into bars with filename tracking.
     """
     # Load audio files with sample rate
-    loaded_audio = {stem: librosa.load(stem) for stem in stems}
+    loaded_audio = {Path(stem).name: librosa.load(stem) for stem in stems}
 
     # Convert each into bars and sort into groups where bars are not empty
     BARS = {}
-    for stem_path, (audio_array, sr) in loaded_audio.items():
-        # Extract filename for key
-        filename = Path(stem_path).stem
+    for stem_filename, (audio_array, sr) in loaded_audio.items():
+        # Extract filename without extension for key
+        filename = Path(stem_filename).stem
 
         # Detect beats
         tempo, beat_frames = librosa.beat.beat_track(y=audio_array, sr=sr)
@@ -77,11 +79,11 @@ def extract_melodic_content(BARS: Dict[str, np.ndarray], sr: int = 22050) -> Dic
 
 def find_pattern_arrangement(BARS: Dict[str, np.ndarray]):
     """ Organise BARS into a proper sequence of arrays."""
-    structure = {}
+    structure = defaultdict(int)
     for i in range(len(BARS[0])):
         # For each time step extract the vectors for the present instruments so any vector with non zero values in it, group into a dictionary
         # where each key are the names of instruments and the values are arrays of soundwave arrays for that particular bar.
-        time_step_dict = {}
+        time_step_dict = defaultdict(int)
         for stem_name in BARS.keys():
             if i < len(BARS[stem_name]):
                 time_step_dict[stem_name] = BARS[stem_name][i] if np.sum(BARS[stem_name][i]) > 0 else None
@@ -90,7 +92,7 @@ def find_pattern_arrangement(BARS: Dict[str, np.ndarray]):
 
 
     
-def sort_structure(BARS: dict[str, np.ndarray]) -> tuple(dict[str, np.ndarray], dict[str, np.ndarray]):
+def sort_structure(BARS: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """
     Sort stems into melody and harmony groups based on melodic content.
 
@@ -145,3 +147,32 @@ def chunk_into_training_segments(feature_matrices):
     # Chunk the feature matrices into training segments.
     return chunking_transformation(feature_matrices, chunk_size=32, overlap=0.5)
 
+
+
+def run(stem_paths: List[str]) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    """
+    Main function to run the audio breakdown and processing pipeline.
+
+    Args:
+        stem_paths: List of file paths to audio stems
+    Returns:
+    """
+    # Step 1: Process audio stems into bars
+    BARS = process_audio_stems(stem_paths)
+    print(f"Processed {len(BARS)} stems into bars.")
+    # Step 2: Extract melodic and harmony groups
+    melodic_stems, harmony_stems = sort_structure(BARS)
+    print(f"Identified {len(melodic_stems)} melodic stems and {len(harmony_stems)} harmony stems.")
+    # Step 3: Process melodic and harmony groups into feature vectors
+    overall_vectors = process_melodic_harmony_groups(melodic_stems, harmony_stems, BARS)
+    print(f"Processed overall vectors for {len(overall_vectors)} time steps.")
+    # Step 4: Convert to feature matrices
+    feature_matrices = convert_to_feature_matrices(overall_vectors)
+    print(f"Converted to feature matrices with shape {feature_matrices.shape}.")
+    # Step 5: Process harmony groups with clustering
+    clustered_harmony = process_harmony_groups_clustering(feature_matrices)
+    print(f"Processed harmony groups into {len(clustered_harmony)} clustered categories.")
+    # Step 6: Chunk into training segments
+    training_segments = chunk_into_training_segments(clustered_harmony)
+    print(f"Chunked into {len(training_segments)} training segments.")
+    return BARS, training_segments

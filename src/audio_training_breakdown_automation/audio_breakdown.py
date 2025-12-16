@@ -1,7 +1,6 @@
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List,Tuple
-import os
 import librosa
 import numpy as np
 
@@ -12,9 +11,19 @@ from src.model_preprocessing.feature_vector_segmentation import extract_feature_
 from src.model_preprocessing.vector_quantisation import vector_quantisation
 from src.model_preprocessing.chunking_transformation import chunking_transformation
 
-def process_audio_stems(stems: List[str]) -> Dict[str, np.ndarray]:
+def process_audio_stems(
+    stems: List[str],
+    tempo_hint: float = None,
+    use_manual_tempo: bool = True
+) -> Dict[str, np.ndarray]:
     """
     Process audio stems into bars with filename tracking.
+
+    Args:
+        stems: List of file paths to audio stems
+        tempo_hint: Optional tempo hint in BPM to improve beat detection accuracy
+        use_manual_tempo: If True and tempo_hint provided, generate beats directly from BPM
+                         instead of using beat tracking (most accurate when tempo is known)
     """
     # Load audio files with sample rate
     loaded_audio = {Path(stem).name: librosa.load(stem) for stem in stems}
@@ -25,14 +34,43 @@ def process_audio_stems(stems: List[str]) -> Dict[str, np.ndarray]:
         # Extract filename without extension for key
         filename = Path(stem_filename).stem
 
-        # Detect beats
-        tempo, beat_frames = librosa.beat.beat_track(y=audio_array, sr=sr)
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        # Detect beats with improved parameters
+        if use_manual_tempo and tempo_hint is not None:
+            # Manual mode: Generate beats directly from known BPM (most accurate)
+            tempo = tempo_hint
+            audio_duration = len(audio_array) / sr
+            beat_duration = 60.0 / tempo  # seconds per beat
+            beat_times = np.arange(0, audio_duration, beat_duration)
+            beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
+            print(f"{filename}: Using manual tempo = {tempo:.1f} BPM, {len(beat_frames)} beats")
+        else:
+            # Automatic detection: Use onset envelope for better beat detection
+            onset_env = librosa.onset.onset_strength(y=audio_array, sr=sr)
+
+            # If tempo hint provided, constrain tempo estimation
+            if tempo_hint is not None:
+                tempo, beat_frames = librosa.beat.beat_track(
+                    onset_envelope=onset_env,
+                    sr=sr,
+                    start_bpm=tempo_hint,
+                    trim=False,
+                    units='frames'
+                )
+            else:
+                # Use aggregate detection across multiple tempo candidates
+                tempo, beat_frames = librosa.beat.beat_track(
+                    onset_envelope=onset_env,
+                    sr=sr,
+                    trim=False,
+                    units='frames'
+                )
+
+            beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+            print(f"{filename}: Detected tempo = {tempo:.1f} BPM, {len(beat_frames)} beats")
 
         # Estimate bars (assuming 4/4 time signature)
         beats_per_bar = 4
         bar_indices = beat_frames[::beats_per_bar]
-
         # Split audio into bars
         bars_for_stem = []
         for i in range(len(bar_indices) - 1):
@@ -80,7 +118,8 @@ def extract_melodic_content(BARS: Dict[str, np.ndarray], sr: int = 22050) -> Dic
 def find_pattern_arrangement(BARS: Dict[str, np.ndarray]):
     """ Organise BARS into a proper sequence of arrays."""
     structure = defaultdict(int)
-    for i in range(len(BARS[0])):
+    
+    for i in range(len(list(BARS.values())[0])):
         # For each time step extract the vectors for the present instruments so any vector with non zero values in it, group into a dictionary
         # where each key are the names of instruments and the values are arrays of soundwave arrays for that particular bar.
         time_step_dict = defaultdict(int)
@@ -107,7 +146,7 @@ def sort_structure(BARS: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], 
 def process_melodic_harmony_groups(melodic_stems, harmony_stems, BARS):
     """ Sort into matrices for each time step representing feature vectors"""
     structure = find_pattern_arrangement(BARS)
-    overall_vectors = []
+    overall_vectors = {}
     for time_step, stem_dict in structure.items():
         melodic_clips = []
         harmony_clips = []
@@ -118,13 +157,13 @@ def process_melodic_harmony_groups(melodic_stems, harmony_stems, BARS):
                     # Assuming sample rate 22050
                 elif stem_name in harmony_stems:
                     harmony_clips.append(bar_audio)  
-        overall_vectors.append((np.array(melodic_clips), np.array(harmony_clips)))
+        overall_vectors[time_step] = np.array([np.array(melodic_clips), np.array(harmony_clips)])
     return overall_vectors
 
 def convert_to_feature_matrices(overall_vectors):
     """ Convert the overall vectors into feature matrices for each time step."""
     feature_matrices = []
-    for melodic_clips, harmony_clips in overall_vectors:
+    for melodic_clips, harmony_clips in overall_vectors.values():
         # Assuming leading melody is the first melodic clip
         if len(melodic_clips) == 0:
             continue
@@ -149,7 +188,7 @@ def chunk_into_training_segments(feature_matrices):
 
 
 
-def run(stem_paths: List[str]) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+def run(stem_paths: List[str], tempo=None, use_manual_tempo=True) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
     """
     Main function to run the audio breakdown and processing pipeline.
 
@@ -158,7 +197,7 @@ def run(stem_paths: List[str]) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
     Returns:
     """
     # Step 1: Process audio stems into bars
-    BARS = process_audio_stems(stem_paths)
+    BARS = process_audio_stems(stem_paths, tempo_hint=tempo, use_manual_tempo=use_manual_tempo)
     print(f"Processed {len(BARS)} stems into bars.")
     # Step 2: Extract melodic and harmony groups
     melodic_stems, harmony_stems = sort_structure(BARS)

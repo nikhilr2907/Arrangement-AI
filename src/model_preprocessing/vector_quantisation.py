@@ -30,7 +30,7 @@ def vector_quantisation(feature_matrices: list[np.ndarray], num_categories: int)
         >>> labels
         array([0, 2, 1])  # matrix1 is cluster 0, matrix2 is cluster 2, etc.
     """
-    if not feature_matrices:
+    if len(feature_matrices) == 0:
         raise ValueError("feature_matrices cannot be empty")
 
     # Verify all matrices have the same shape

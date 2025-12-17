@@ -79,8 +79,8 @@ def process_audio_stems(
             bar_audio = audio_array[start_sample:end_sample]
 
             # Filter out empty bars (check if RMS energy is above threshold)
-            if np.sqrt(np.mean(bar_audio**2)) > 0.01:
-                bars_for_stem.append(bar_audio)
+                
+            bars_for_stem.append(bar_audio)
 
         # Add to BARS dictionary if bars exist
         if bars_for_stem:
@@ -157,7 +157,7 @@ def process_melodic_harmony_groups(melodic_stems, harmony_stems, BARS):
                     # Assuming sample rate 22050
                 elif stem_name in harmony_stems:
                     harmony_clips.append(bar_audio)  
-        overall_vectors[time_step] = np.array([np.array(melodic_clips), np.array(harmony_clips)])
+        overall_vectors[time_step] = (np.array(melodic_clips,dtype=object),np.array(harmony_clips,dtype=object))
     return overall_vectors
 
 def convert_to_feature_matrices(overall_vectors):
@@ -215,3 +215,6 @@ def run(stem_paths: List[str], tempo=None, use_manual_tempo=True) -> Tuple[Dict[
     training_segments = chunk_into_training_segments(clustered_harmony)
     print(f"Chunked into {len(training_segments)} training segments.")
     return BARS, training_segments
+
+
+

@@ -109,24 +109,98 @@ class VQ_VAE(nn.Module):
 
 
 
-# if __name__ == "__main__":
-#     model = VQ_VAE(input_size=500, batch_size=20)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-#     x = torch.randn(500, 25, 128)
-#     x_reshaped = x.view(x.shape[0], -1)
-#     model = VQ_VAE(input_size=x_reshaped.shape[1], batch_size=x_reshaped.shape[0])
 
-#     for i in range(5):
-#         for start_len in range(10):
-#             print(f"Iteration {i}, Batch {start_len}")
-#             x_reshaped = x[start_len*50:(start_len+1)*50].view(50, -1)
-#             recon_x, z_e, emb = model(x_reshaped)
-#             print("Reconstructed x shape:", recon_x.shape)
-#             print("Encoded z_e shape:", z_e.shape)
-#             print("Embedding shape:", emb.shape)
-#             print("Original x shape:", x_reshaped.shape)
-#             loss = model.loss_function(x_reshaped, recon_x, z_e, emb)
-#             print("Loss:", loss.item())
-#             optimizer.zero_grad()
-#             loss.backward()
-#             optimizer.step()
+class VQ_VAE_TRAINER(nn.Module):
+
+    def __init__(self, vq_vae_model):
+        super().__init__()
+        self.vq_vae = vq_vae_model
+
+    def forward(self, x):
+        recon_x, z_e, emb = self.vq_vae(x)
+        loss = self.vq_vae.loss_function(x, recon_x, z_e, emb)
+        return recon_x, loss
+
+    def model_train_step(self, x, optimizer):
+        self.train()
+        optimizer.zero_grad()
+        recon_x, loss = self.forward(x)
+        loss.backward()
+        optimizer.step()
+        return recon_x, loss
+    def model_eval_step(self, x):
+        self.eval()
+        with torch.no_grad():
+            recon_x, loss = self.forward(x)
+        return recon_x, loss
+    def extract_vectors_categories(self):
+        """
+        Extract the learned codebook embeddings.
+
+        Returns:
+            torch.Tensor: Codebook embeddings of shape (emb_dim, num_embeddings)
+        """
+        self.eval()
+        return self.vq_vae.emb.weight.detach().clone()
+
+    def get_encoded_indices(self, x):
+        """
+        Get the quantized indices for input data.
+
+        Args:
+            x: Input tensor
+
+        Returns:
+            indices: Tensor of discrete indices for each encoded position
+        """
+        self.eval()
+        with torch.no_grad():
+            z_e = self.vq_vae.encode(x)
+            _, indices = self.vq_vae.emb(z_e, weight_sg=True)
+        return indices
+    def save_model_weights(self, save_path: str):
+        """
+        Save the model weights to a file.
+
+        Args:
+            save_path: Path to save the model weights
+        """
+        torch.save(self.vq_vae.state_dict(), save_path)
+        print(f"Saved model weights to {save_path}")
+    def save_embeddings(self, save_path: str):
+        """
+        Save the learned codebook embeddings to a file.
+
+        Args:
+            save_path: Path to save the embeddings
+        """
+        embeddings = self.extract_vectors_categories()
+        torch.save({
+            'embeddings': embeddings,
+            'emb_size': self.vq_vae.emb_size,
+            'hidden': self.vq_vae.hidden,
+        }, save_path)
+        print(f"Saved embeddings of shape {embeddings.shape} to {save_path}")
+
+    def load_embeddings(self, load_path: str):
+        """
+        Load previously saved embeddings into the model.
+
+        Args:
+            load_path: Path to load the embeddings from
+        """
+        checkpoint = torch.load(load_path)
+        self.vq_vae.emb.weight.data = checkpoint['embeddings']
+        print(f"Loaded embeddings of shape {checkpoint['embeddings'].shape} from {load_path}")
+    
+    def full_training_sequence(self,train_loader,optimizer,num_epochs):
+        for epoch in range(num_epochs):
+            total_loss = 0
+            for batch_idx, data in enumerate(train_loader):
+                inputs = data
+                recon_x, loss = self.model_train_step(inputs, optimizer)
+                total_loss += loss.item()
+            avg_loss = total_loss / len(train_loader)
+            print(f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {avg_loss:.4f}")
+        
+

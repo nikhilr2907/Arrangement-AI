@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from src.model_preprocessing.quantization.nearest_embed import NearestEmbed
 
 
@@ -18,22 +19,20 @@ class VQ_VAE(nn.Module):
         self.ce_loss = 0
         self.vq_loss = 0
         self.commit_loss = 0
-
         self.encoder_spatial_shape = None
-
         self.fc1 = nn.Linear(self.input_size, 400)
         self.fc2 = nn.Linear(3200, hidden)
+        self.fc_bottleneck = nn.Linear(hidden, self.emb_size)  # Encoder bottleneck: 200 -> 10
+        self.fc_expand = nn.Linear(self.emb_size, hidden)  # Decoder expansion: 10 -> 200
         self.fc3 = nn.Linear(hidden, 3200)
         self.decoder_fc1 = nn.Linear(100, 400)
         self.fc4 = nn.Linear(400, self.input_size)
-
         self.conv1 = nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
         self.conv2 = nn.Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
         self.decoder_conv1 = nn.ConvTranspose2d(128, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
         self.decoder_conv2 = nn.ConvTranspose2d(64, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
         self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
         self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
-
         self.emb = NearestEmbed(k, self.emb_size)
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
@@ -52,14 +51,18 @@ class VQ_VAE(nn.Module):
         h5 = self.pool2(h4)
         print("shape after pool2:", h5.shape)
         self.encoder_spatial_shape = h5.shape[1:]
-        h6 = self.fc2(h5.view(batch_size, -1))
+        h6 = self.relu(self.fc2(h5.view(batch_size, -1)))
         print("shape after fc2:", h6.shape)
-        return h6.view(batch_size, self.emb_size, int(self.hidden / self.emb_size))
+        h7 = self.fc_bottleneck(h6)
+        print("shape after bottleneck:", h7.shape)
+        return h7.view(batch_size, self.emb_size)
 
     def decode(self, z):
         batch_size = z.shape[0]
         print("shape of z in decode:", z.shape)
-        d1 = self.relu(self.fc3(z))
+        d0 = self.relu(self.fc_expand(z))
+        print("shape after expand:", d0.shape)
+        d1 = self.relu(self.fc3(d0))
         print("shape after fc3 and relu:", d1.shape)
         d2 = d1.view(batch_size, *self.encoder_spatial_shape)
         print("shape after reshaping d1:", d2.shape)
@@ -84,8 +87,8 @@ class VQ_VAE(nn.Module):
         z_q, _ = self.emb(z_e, weight_sg=True)
         print("shape of z_q before decode:", z_q.shape)
         emb, _ = self.emb(z_e.detach())
-        z_q = z_q.view(-1, self.hidden)
-        
+        z_q = z_q.view(-1, self.emb_size)
+
         return self.decode(z_q), z_e, emb
 
     def sample(self, size):
@@ -112,9 +115,6 @@ class VQ_VAE(nn.Module):
         z_q, _ = self.emb(z_e, weight_sg=True)
         # Need to return the actual codes not the vectors themselves.
         return z_q
-
-
-
 
 class VQ_VAE_TRAINER(nn.Module):
 
@@ -149,21 +149,6 @@ class VQ_VAE_TRAINER(nn.Module):
         self.eval()
         return self.vq_vae.emb.weight.detach().clone()
 
-    def get_encoded_indices(self, x):
-        """
-        Get the quantized indices for input data.
-
-        Args:
-            x: Input tensor
-
-        Returns:
-            indices: Tensor of discrete indices for each encoded position
-        """
-        self.eval()
-        with torch.no_grad():
-            z_e = self.vq_vae.encode(x)
-            _, indices = self.vq_vae.emb(z_e, weight_sg=True)
-        return indices
     def save_model_weights(self, save_path: str):
         """
         Save the model weights to a file.
@@ -217,8 +202,30 @@ class VQ_VAE_TRAINER(nn.Module):
                 inputs = data
                 vector = self.vq_vae.quantized_forward_pass(inputs)
                 np_vector = vector.to_numpy()
-                npz.savez_compressed(f"{path_to_data}/quantized_chunk_{batch_idx}.npz",quantized_indices=np_vector)
+                np.savez_compressed(f"{path_to_data}/quantized_chunk_{batch_idx}.npz",quantized_indices=np_vector)
 
+
+if __name__ == "__main__":
+    model = VQ_VAE(input_size=500, batch_size=20)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    x = torch.randn(500, 25, 128)
+    x_reshaped = x.view(x.shape[0], -1)
+    model = VQ_VAE(input_size=x_reshaped.shape[1], batch_size=x_reshaped.shape[0])
+
+    for i in range(1):
+        for start_len in range(1):
+            print(f"Iteration {i}, Batch {start_len}")
+            x_reshaped = x[start_len*50:(start_len+1)*50].view(50, -1)
+            recon_x, z_e, emb = model(x_reshaped)
+            print("Reconstructed x shape:", recon_x.shape)
+            print("Encoded z_e shape:", z_e.shape)
+            print("Embedding shape:", emb.shape)
+            print("Original x shape:", x_reshaped.shape)
+            loss = model.loss_function(x_reshaped, recon_x, z_e, emb)
+            print("Loss:", loss.item())
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
 
         

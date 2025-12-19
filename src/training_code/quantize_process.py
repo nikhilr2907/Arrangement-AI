@@ -54,11 +54,11 @@ class QuantizationProcessor:
             # Convert to tensor
             chunks_tensor = torch.from_numpy(chunks_reshaped).float()
 
-            # Get quantized indices
+            # Get quantized indices (single index per time step)
             all_indices = []
             for i in range(0, len(chunks_tensor), batch_size):
                 batch = chunks_tensor[i:i + batch_size]
-                indices = self.trainer.get_encoded_indices(batch)
+                indices = self.trainer.get_encoded_indices(batch, flatten=True)
                 all_indices.append(indices.cpu().numpy())
 
             # Concatenate all indices
@@ -104,11 +104,11 @@ class QuantizationProcessor:
         chunks_reshaped = chunks.reshape(chunks.shape[0], -1)
         chunks_tensor = torch.from_numpy(chunks_reshaped).float()
 
-        # Quantize in batches
+        # Quantize in batches (single index per time step)
         all_indices = []
         for i in range(0, len(chunks_tensor), batch_size):
             batch = chunks_tensor[i:i + batch_size]
-            indices = self.trainer.get_encoded_indices(batch)
+            indices = self.trainer.get_encoded_indices(batch, flatten=True)
             all_indices.append(indices.cpu().numpy())
 
         quantized_indices = np.concatenate(all_indices, axis=0)

@@ -152,6 +152,54 @@ class ImprovedMusicalTransformer(nn.Module):
 
         return loss
 
+    def _forward_with_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass that returns both logits and final hidden states.
+
+        Args:
+            input_ids: (batch, seq_len) - token indices
+            attention_mask: (batch, seq_len) - 1 for real tokens, 0 for padding
+
+        Returns:
+            logits: (batch, seq_len, vocab_size)
+            hidden_states: (batch, seq_len, model_dim) - pre-logit representations
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # Create position indices
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+        # Embed tokens and add positional encoding
+        token_embeds = self.embedding(input_ids)
+        pos_embeds = self.positional_encoding(positions)
+        embedded = self.dropout(token_embeds + pos_embeds)
+
+        # Create masks
+        causal_mask = self._create_causal_mask(seq_len, device)
+
+        if attention_mask is None:
+            padding_mask = self._create_padding_mask(input_ids)
+        else:
+            padding_mask = ~attention_mask.bool()
+
+        # Transformer forward pass
+        hidden_states = self.transformer_decoder(
+            embedded,
+            embedded,
+            tgt_mask=causal_mask,
+            tgt_key_padding_mask=padding_mask,
+        )
+
+        # Project to vocabulary
+        logits = self.output_linear(hidden_states)
+
+        return logits, hidden_states
+
     @torch.no_grad()
     def generate(
         self,
@@ -161,7 +209,8 @@ class ImprovedMusicalTransformer(nn.Module):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         stop_at_eos: bool = True,
-    ) -> torch.Tensor:
+        return_hidden_states: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Autoregressive generation with various sampling strategies.
 
@@ -172,6 +221,11 @@ class ImprovedMusicalTransformer(nn.Module):
             top_k: Keep only top k tokens
             top_p: Nucleus sampling threshold
             stop_at_eos: Stop generation when EOS is produced
+            return_hidden_states: If True, return final hidden states along with tokens
+
+        Returns:
+            generated: (batch, seq_len) - generated token sequence
+            hidden_states: (batch, seq_len, model_dim) - final hidden states (if return_hidden_states=True)
         """
         self.eval()
         generated = input_ids.clone()
@@ -210,7 +264,12 @@ class ImprovedMusicalTransformer(nn.Module):
             if stop_at_eos and (next_token == self.eos_idx).all():
                 break
 
-        return generated
+        # Get final hidden states if requested
+        if return_hidden_states:
+            _, hidden_states = self._forward_with_hidden_states(generated)
+            return generated, hidden_states
+
+        return generated, None
 
 
 def collate_variable_length_sequences(
@@ -353,7 +412,7 @@ class VariableLengthTrainer:
                     target_seq = seq.clone().unsqueeze(0).to(self.device)
 
                     # Mask early positions
-                    target_seq[:, :-pred_len] = -100
+                    target_seq = target_seq.clone()[:,pred_len:]
 
                     loss = self.model.compute_loss(input_seq, target_seq)
                     horizon_loss += loss.item()

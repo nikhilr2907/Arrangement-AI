@@ -1,15 +1,15 @@
-from collections import defaultdict
+"""Audio breakdown and processing pipeline for musical stems."""
+
 from pathlib import Path
-from typing import Dict, List,Tuple
+from typing import Dict, List, Tuple
+
 import librosa
 import numpy as np
 
-
 from src.latent_preprocessing.melodic_candidates import find_melodic_candidates
-from src.latent_preprocessing.extract_leading_melody import is_leading_melody
 from src.model_preprocessing.feature_vector_segmentation import extract_feature_matrix
-from src.model_preprocessing.vector_quantisation import vector_quantisation
 from src.model_preprocessing.chunking_transformation import chunking_transformation
+
 
 def process_audio_stems(
     stems: List[str],
@@ -17,204 +17,230 @@ def process_audio_stems(
     use_manual_tempo: bool = True
 ) -> Dict[str, np.ndarray]:
     """
-    Process audio stems into bars with filename tracking.
+    Process audio stems into bars.
 
     Args:
         stems: List of file paths to audio stems
-        tempo_hint: Optional tempo hint in BPM to improve beat detection accuracy
-        use_manual_tempo: If True and tempo_hint provided, generate beats directly from BPM
-                         instead of using beat tracking (most accurate when tempo is known)
-    """
-    # Load audio files with sample rate
-    loaded_audio = {Path(stem).name: librosa.load(stem) for stem in stems}
-
-    # Convert each into bars and sort into groups where bars are not empty
-    BARS = {}
-    for stem_filename, (audio_array, sr) in loaded_audio.items():
-        # Extract filename without extension for key
-        filename = Path(stem_filename).stem
-
-        # Detect beats with improved parameters
-        if use_manual_tempo and tempo_hint is not None:
-            # Manual mode: Generate beats directly from known BPM (most accurate)
-            tempo = tempo_hint
-            audio_duration = len(audio_array) / sr
-            beat_duration = 60.0 / tempo  # seconds per beat
-            beat_times = np.arange(0, audio_duration, beat_duration)
-            beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
-            print(f"{filename}: Using manual tempo = {tempo:.1f} BPM, {len(beat_frames)} beats")
-        else:
-            # Automatic detection: Use onset envelope for better beat detection
-            onset_env = librosa.onset.onset_strength(y=audio_array, sr=sr)
-
-            # If tempo hint provided, constrain tempo estimation
-            if tempo_hint is not None:
-                tempo, beat_frames = librosa.beat.beat_track(
-                    onset_envelope=onset_env,
-                    sr=sr,
-                    start_bpm=tempo_hint,
-                    trim=False,
-                    units='frames'
-                )
-            else:
-                # Use aggregate detection across multiple tempo candidates
-                tempo, beat_frames = librosa.beat.beat_track(
-                    onset_envelope=onset_env,
-                    sr=sr,
-                    trim=False,
-                    units='frames'
-                )
-
-            beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-            print(f"{filename}: Detected tempo = {tempo:.1f} BPM, {len(beat_frames)} beats")
-
-        # Estimate bars (assuming 4/4 time signature)
-        beats_per_bar = 4
-        bar_indices = beat_frames[::beats_per_bar]
-        # Split audio into bars
-        bars_for_stem = []
-        for i in range(len(bar_indices) - 1):
-            start_sample = librosa.frames_to_samples(bar_indices[i])
-            end_sample = librosa.frames_to_samples(bar_indices[i + 1])
-            bar_audio = audio_array[start_sample:end_sample]
-
-            # Filter out empty bars (check if RMS energy is above threshold)
-                
-            bars_for_stem.append(bar_audio)
-
-        # Add to BARS dictionary if bars exist
-        if bars_for_stem:
-            BARS[filename] = np.array(bars_for_stem, dtype=object)
-
-    return BARS
-
-
-def extract_melodic_content(BARS: Dict[str, np.ndarray], sr: int = 22050) -> Dict[str, tuple]:
-    """
-    Extract the leading melodic content from bars.
-
-    Args:
-        BARS: Dictionary mapping filename to array of bars
-        sr: Sample rate for audio
+        tempo_hint: Optional tempo hint in BPM for beat detection
+        use_manual_tempo: If True and tempo_hint provided, use manual tempo instead of detection
 
     Returns:
-        Dictionary mapping filename to (audio_array, sample_rate) for leading melody group
+        Dictionary mapping stem filename to array of bar audio segments
     """
-    # Find the candidates which can be main melodies
-    melodic_candidates = find_melodic_candidates(BARS, activity_threshold=0.5)
+    loaded_audio = {Path(stem).name: librosa.load(stem) for stem in stems}
+    bars_dict = {}
 
-    # Convert bars to AudioClip format (audio_array, sample_rate)
-    audio_clips = {}
-    for filename, bars in melodic_candidates.items():
-        # Concatenate all bars for this stem into a single array
-        concatenated = np.concatenate(bars)
-        audio_clips[filename] = (concatenated, sr)
+    for stem_filename, (audio_array, sr) in loaded_audio.items():
+        filename = Path(stem_filename).stem
 
-    # Find the leading melody group
-    leading_melody = is_leading_melody(audio_clips, max_group_size=3, compatibility_threshold=0.3)
+        # Detect or calculate beats
+        if use_manual_tempo and tempo_hint is not None:
+            beat_frames = _generate_beats_from_tempo(audio_array, sr, tempo_hint)
+            print(f"{filename}: Using manual tempo = {tempo_hint:.1f} BPM, {len(beat_frames)} beats")
+        else:
+            tempo, beat_frames = _detect_beats(audio_array, sr, tempo_hint)
+            print(f"{filename}: Detected tempo = {tempo:.1f} BPM, {len(beat_frames)} beats")
 
-    return leading_melody
+        # Convert beats to bars (4/4 time signature)
+        bars = _extract_bars(audio_array, beat_frames, beats_per_bar=4)
 
-def find_pattern_arrangement(BARS: Dict[str, np.ndarray]):
-    """ Organise BARS into a proper sequence of arrays."""
-    structure = defaultdict(int)
-    
-    for i in range(len(list(BARS.values())[0])):
-        # For each time step extract the vectors for the present instruments so any vector with non zero values in it, group into a dictionary
-        # where each key are the names of instruments and the values are arrays of soundwave arrays for that particular bar.
-        time_step_dict = defaultdict(int)
-        for stem_name in BARS.keys():
-            if i < len(BARS[stem_name]):
-                time_step_dict[stem_name] = BARS[stem_name][i] if np.sum(BARS[stem_name][i]) > 0 else None
-        structure[i] = time_step_dict
-    return structure        
+        if bars:
+            bars_dict[filename] = np.array(bars, dtype=object)
+
+    return bars_dict
 
 
-    
-def sort_structure(BARS: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+def _generate_beats_from_tempo(audio_array: np.ndarray, sr: int, tempo: float) -> np.ndarray:
+    """Generate beat frames directly from known BPM."""
+    audio_duration = len(audio_array) / sr
+    beat_duration = 60.0 / tempo
+    beat_times = np.arange(0, audio_duration, beat_duration)
+    return librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
+
+
+def _detect_beats(audio_array: np.ndarray, sr: int, tempo_hint: float = None) -> Tuple[float, np.ndarray]:
+    """Detect beats using onset envelope."""
+    onset_env = librosa.onset.onset_strength(y=audio_array, sr=sr)
+
+    kwargs = {
+        'onset_envelope': onset_env,
+        'sr': sr,
+        'trim': False,
+        'units': 'frames'
+    }
+
+    if tempo_hint is not None:
+        kwargs['start_bpm'] = tempo_hint
+
+    return librosa.beat.beat_track(**kwargs)
+
+
+def _extract_bars(
+    audio_array: np.ndarray,
+    beat_frames: np.ndarray,
+    beats_per_bar: int = 4
+) -> List[np.ndarray]:
+    """Extract bar-length audio segments from beat frames."""
+    bar_indices = beat_frames[::beats_per_bar]
+    bars = []
+
+    for i in range(len(bar_indices) - 1):
+        start_sample = librosa.frames_to_samples(bar_indices[i])
+        end_sample = librosa.frames_to_samples(bar_indices[i + 1])
+        bars.append(audio_array[start_sample:end_sample])
+
+    return bars
+
+
+def sort_structure(bars: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     """
-    Sort stems into melody and harmony groups based on melodic content.
+    Sort stems into melodic and harmonic groups.
 
     Args:
-        BARS: Dictionary mapping filename to array of bars
+        bars: Dictionary mapping filename to array of bars
+
+    Returns:
+        Tuple of (melodic_stems, harmonic_stems) dictionaries
     """
-    # Find a sequence where all melody clips are playing together, must be a sequence for this
-    melodic_candidates = find_melodic_candidates(BARS, activity_threshold=0.5)
-    harmony_candidates = {k: v for k, v in BARS.items() if k not in melodic_candidates}
-    return melodic_candidates, harmony_candidates
-    
-def process_melodic_harmony_groups(melodic_stems, harmony_stems, BARS):
-    """ Sort into matrices for each time step representing feature vectors"""
-    structure = find_pattern_arrangement(BARS)
+    melodic_stems = find_melodic_candidates(bars, activity_threshold=0.5)
+    harmonic_stems = {k: v for k, v in bars.items() if k not in melodic_stems}
+    return melodic_stems, harmonic_stems
+
+
+def _build_pattern_structure(bars: Dict[str, np.ndarray]) -> Dict[int, Dict[str, np.ndarray]]:
+    """
+    Organize bars into time-step structure.
+
+    Args:
+        bars: Dictionary mapping filename to array of bars
+
+    Returns:
+        Dictionary mapping time step to stem audio for that bar
+    """
+    if not bars:
+        return {}
+
+    max_bars = max(len(bar_array) for bar_array in bars.values())
+    structure = {}
+
+    for time_step in range(max_bars):
+        time_step_dict = {}
+        for stem_name, bar_array in bars.items():
+            if time_step < len(bar_array) and np.sum(bar_array[time_step]) > 0:
+                time_step_dict[stem_name] = bar_array[time_step]
+        structure[time_step] = time_step_dict
+
+    return structure
+
+
+def process_melodic_harmony_groups(
+    melodic_stems: Dict[str, np.ndarray],
+    harmonic_stems: Dict[str, np.ndarray],
+    bars: Dict[str, np.ndarray]
+) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+    """
+    Process melodic and harmonic groups into time-step vectors.
+
+    Args:
+        melodic_stems: Dictionary of melodic stem bars
+        harmonic_stems: Dictionary of harmonic stem bars
+        bars: Full dictionary of all bars
+
+    Returns:
+        Dictionary mapping time step to (melodic_clips, harmonic_clips) tuple
+    """
+    structure = _build_pattern_structure(bars)
     overall_vectors = {}
+
     for time_step, stem_dict in structure.items():
         melodic_clips = []
-        harmony_clips = []
+        harmonic_clips = []
+
         for stem_name, bar_audio in stem_dict.items():
-            if bar_audio is not None:
-                if stem_name in melodic_stems:
-                    melodic_clips.append(bar_audio)
-                    # Assuming sample rate 22050
-                elif stem_name in harmony_stems:
-                    harmony_clips.append(bar_audio)  
-        overall_vectors[time_step] = (np.array(melodic_clips,dtype=object),np.array(harmony_clips,dtype=object))
+            if stem_name in melodic_stems:
+                melodic_clips.append(bar_audio)
+            elif stem_name in harmonic_stems:
+                harmonic_clips.append(bar_audio)
+
+        overall_vectors[time_step] = (
+            np.array(melodic_clips, dtype=object),
+            np.array(harmonic_clips, dtype=object)
+        )
+
     return overall_vectors
 
-def convert_to_feature_matrices(overall_vectors):
-    """ Convert the overall vectors into feature matrices for each time step."""
+
+def convert_to_feature_matrices(overall_vectors: Dict[int, Tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
+    """
+    Convert time-step vectors into feature matrices.
+
+    Args:
+        overall_vectors: Dictionary mapping time step to (melodic, harmonic) clip tuples
+
+    Returns:
+        Array of feature matrices
+    """
     feature_matrices = []
-    for melodic_clips, harmony_clips in overall_vectors.values():
-        # Assuming leading melody is the first melodic clip
+
+    for melodic_clips, harmonic_clips in overall_vectors.values():
         if len(melodic_clips) == 0:
             continue
-        leading_melody_clip = melodic_clips
-        harmonic_clips = harmony_clips
 
-        feature_matrix = extract_feature_matrix(harmonic_clips, leading_melody_clip)
+        feature_matrix = extract_feature_matrix(harmonic_clips, melodic_clips)
         feature_matrices.append(feature_matrix)
+
     return np.array(feature_matrices)
 
 
-def process_harmony_groups_clustering(harmony_stems):
-
-    # Process harmony groups into clustered categories.
-    clustered_harmony = vector_quantisation(harmony_stems, num_categories=3)
-    return clustered_harmony
-    
-def chunk_into_training_segments(feature_matrices):
-
-    # Chunk the feature matrices into training segments.
-    return chunking_transformation(feature_matrices, chunk_size=32, overlap=0.5)
-
-
-
-def run(stem_paths: List[str], tempo=None, use_manual_tempo=True) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+def chunk_into_training_segments(feature_matrices: np.ndarray, chunk_size: int = 32, overlap: float = 0.5) -> np.ndarray:
     """
-    Main function to run the audio breakdown and processing pipeline.
+    Chunk feature matrices into training segments.
+
+    Args:
+        feature_matrices: Array of feature matrices
+        chunk_size: Size of each chunk
+        overlap: Overlap ratio between chunks
+
+    Returns:
+        Array of chunked training segments
+    """
+    return chunking_transformation(feature_matrices, chunk_size=chunk_size, overlap=overlap)
+
+
+def run(
+    stem_paths: List[str],
+    tempo: float = None,
+    use_manual_tempo: bool = True
+) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    """
+    Run the complete audio breakdown and processing pipeline.
 
     Args:
         stem_paths: List of file paths to audio stems
+        tempo: Optional tempo in BPM
+        use_manual_tempo: Whether to use manual tempo if provided
+
     Returns:
+        Tuple of (bars_dict, training_segments)
     """
-    # Step 1: Process audio stems into bars
-    BARS = process_audio_stems(stem_paths, tempo_hint=tempo, use_manual_tempo=use_manual_tempo)
-    print(f"Processed {len(BARS)} stems into bars.")
-    # Step 2: Extract melodic and harmony groups
-    melodic_stems, harmony_stems = sort_structure(BARS)
-    print(f"Identified {len(melodic_stems)} melodic stems and {len(harmony_stems)} harmony stems.")
-    # Step 3: Process melodic and harmony groups into feature vectors
-    overall_vectors = process_melodic_harmony_groups(melodic_stems, harmony_stems, BARS)
+    # Process stems into bars
+    bars = process_audio_stems(stem_paths, tempo_hint=tempo, use_manual_tempo=use_manual_tempo)
+    print(f"Processed {len(bars)} stems into bars.")
+
+    # Sort into melodic and harmonic groups
+    melodic_stems, harmonic_stems = sort_structure(bars)
+    print(f"Identified {len(melodic_stems)} melodic stems and {len(harmonic_stems)} harmonic stems.")
+
+    # Process groups into feature vectors
+    overall_vectors = process_melodic_harmony_groups(melodic_stems, harmonic_stems, bars)
     print(f"Processed overall vectors for {len(overall_vectors)} time steps.")
-    # Step 4: Convert to feature matrices
+
+    # Convert to feature matrices
     feature_matrices = convert_to_feature_matrices(overall_vectors)
     print(f"Converted to feature matrices with shape {feature_matrices.shape}.")
-    # Step 5: Process harmony groups with clustering
-    clustered_harmony = process_harmony_groups_clustering(feature_matrices)
-    print(f"Processed harmony groups into {len(clustered_harmony)} clustered categories.")
-    # Step 6: Chunk into training segments
-    training_segments = chunk_into_training_segments(clustered_harmony)
+
+    # Chunk into training segments
+    training_segments = chunk_into_training_segments(feature_matrices)
     print(f"Chunked into {len(training_segments)} training segments.")
-    return BARS, training_segments
 
-
-
+    return bars, training_segments

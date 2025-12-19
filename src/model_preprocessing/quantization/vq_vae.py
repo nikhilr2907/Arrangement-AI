@@ -6,7 +6,6 @@ from src.model_preprocessing.quantization.nearest_embed import NearestEmbed
 
 class VQ_VAE(nn.Module):
     """Vector Quantized AutoEncoder"""
-
     def __init__(self, hidden=200, k=10, vq_coef=0.2, comit_coef=0.4, input_size=None, batch_size=None):
         super(VQ_VAE, self).__init__()
 
@@ -105,7 +104,14 @@ class VQ_VAE(nn.Module):
         return self.ce_loss + self.vq_coef * self.vq_loss + self.comit_coef * self.commit_loss
 
     def latest_losses(self):
-        return {'cross_entropy': self.ce_loss, 'vq': self.vq_loss, 'commitment': self.commit_loss}
+        return {'cross_entropy': self.ce_loss, 'vq': self.vq_loss, 'commitment': self.commit_loss}#
+    
+    def quantized_forward_pass(self, x):
+        """Forward pass that returns quantized embeddings for input x."""
+        z_e = self.encode(x)
+        z_q, _ = self.emb(z_e, weight_sg=True)
+        # Need to return the actual codes not the vectors themselves.
+        return z_q
 
 
 
@@ -202,5 +208,18 @@ class VQ_VAE_TRAINER(nn.Module):
                 total_loss += loss.item()
             avg_loss = total_loss / len(train_loader)
             print(f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {avg_loss:.4f}")
+    
+    def full_evaluation_sequence(self,path_to_data,train_loader):
+        """ All training data loaded and original vectors quantized after training and saved to relevant folder."""
+        total_loss = 0
+        with torch.no_grad():
+            for batch_idx, data in enumerate(train_loader):
+                inputs = data
+                vector = self.vq_vae.quantized_forward_pass(inputs)
+                np_vector = vector.to_numpy()
+                npz.savez_compressed(f"{path_to_data}/quantized_chunk_{batch_idx}.npz",quantized_indices=np_vector)
+
+
+
         
 

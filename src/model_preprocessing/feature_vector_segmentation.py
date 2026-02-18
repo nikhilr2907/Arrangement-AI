@@ -1,131 +1,111 @@
+"""
+Feature extraction from bar-level audio clips.
+
+Two entry points:
+    extract_feature_matrix()    → (25, T_frames)  full time-series, used internally
+    extract_bar_feature_vector() → (25,)           mean-pooled, used for VQ-VAE training
+"""
+
+from typing import List, Optional
+
 import librosa
 import numpy as np
 
 
 def extract_feature_matrix(
-    main_melody: np.ndarray = None,
-    harmonic_clips: np.ndarray = None,
-    sr: int = 22050
+    main_melody: Optional[np.ndarray] = None,
+    harmonic_clips: Optional[np.ndarray] = None,
+    sr: int = 22050,
 ) -> np.ndarray:
     """
-    Extracts the combined, time-series feature matrix for arrangement analysis.
-
-    The output matrix F has the shape (N_features x N_frames), where each column
-    F[:, t] is the synchronized feature vector for time step t (25 features:
-    12 Melody Chroma + 12 Harmony Chroma + 1 Rhythmic Density).
+    Extracts the combined time-series feature matrix for a bar.
 
     Args:
-        main_melody: Array of audio arrays for leading melody clips (optional)
-                    If None or empty, melody chroma features will be zeros
-        harmonic_clips: Array of audio arrays for harmony parts (optional)
-                       If None or empty, harmony chroma features will be zeros
-        sr: Sample rate (default 22050)
+        main_melody:    Array of audio arrays for leading melody clips
+        harmonic_clips: Array of audio arrays for harmony parts
+        sr:             Sample rate
 
     Returns:
-        A 2D numpy array (Feature Matrix) where columns are time steps (frames).
-        Always returns shape (25, n_frames).
-
-    Note:
-        At least one of main_melody or harmonic_clips must be provided.
+        (25, T_frames) numpy array
+        Rows: 12 melody chroma + 12 harmony chroma + 1 rhythmic density
     """
-
-    # Validate that at least one input is provided
-    has_melody = main_melody is not None and len(main_melody) > 0
+    has_melody  = main_melody is not None and len(main_melody) > 0
     has_harmony = harmonic_clips is not None and len(harmonic_clips) > 0
 
     if not has_melody and not has_harmony:
         raise ValueError("At least one of main_melody or harmonic_clips must be provided.")
-    print("shape of main melody:", main_melody.shape)
-    print("shape of harmonic clips:", harmonic_clips.shape)
- 
 
-    n_fft = 2048
+    n_fft      = 2048
     hop_length = 512
 
-    # --- 1. Calculate Melody Chroma (12 dim) ---
+    # --- Melody chroma (12 dim) ---
+    melody_chroma_matrices = []
+    melody_signals = []
     if has_melody:
-        # Has melody - compute normally
-        melody_chroma_matrices = []
-        melody_signals = []
-
         for y_melody in main_melody:
             y_melody = np.array(y_melody, dtype=np.float32)
-            y_harm_mel = librosa.effects.hpss(y_melody, margin=3.0, kernel_size=n_fft)[0]
-            chroma_mel = librosa.feature.chroma_cens(
-                y=y_harm_mel, sr=sr, hop_length=hop_length
-            )
-            melody_chroma_matrices.append(chroma_mel)
+            y_harm   = librosa.effects.hpss(y_melody, margin=3.0, kernel_size=n_fft)[0]
+            chroma   = librosa.feature.chroma_cens(y=y_harm, sr=sr, hop_length=hop_length)
+            melody_chroma_matrices.append(chroma)
             melody_signals.append(y_melody)
-    else:
-        # No melody - will use zeros later
-        melody_chroma_matrices = []
-        melody_signals = []
 
-    # --- 2. Calculate and Average Harmony Chroma (12 dim) ---
+    # --- Harmony chroma (12 dim) ---
+    harmony_chroma_matrices = []
+    harmony_signals = []
     if has_harmony:
-        # Has harmony - compute normally
-        harmony_chroma_matrices = []
-        harmony_signals = []
-
         for y_clip in harmonic_clips:
             y_clip = np.array(y_clip, dtype=np.float32)
             y_harm = librosa.effects.hpss(y_clip, margin=3.0, kernel_size=n_fft)[0]
-            chroma_matrix = librosa.feature.chroma_cens(
-                y=y_harm, sr=sr, hop_length=hop_length
-            )
-            harmony_chroma_matrices.append(chroma_matrix)
+            chroma = librosa.feature.chroma_cens(y=y_harm, sr=sr, hop_length=hop_length)
+            harmony_chroma_matrices.append(chroma)
             harmony_signals.append(y_clip)
-    else:
-        # No harmony - will use zeros later
-        harmony_chroma_matrices = []
-        harmony_signals = []
 
-    # --- 3. Determine dimensions and compute averaged features ---
-    # Determine minimum number of frames across all available clips
-    all_chroma_matrices = melody_chroma_matrices + harmony_chroma_matrices
-    min_frames = min(m.shape[1] for m in all_chroma_matrices)
+    # Align frame counts
+    all_chromas = melody_chroma_matrices + harmony_chroma_matrices
+    min_frames  = min(m.shape[1] for m in all_chromas)
 
-    # Compute melody chroma matrix
-    if has_melody:
-        # Average melody chroma matrices (if multiple leading melodies)
-        chroma_mel_matrix = np.mean(
-            [m[:, :min_frames] for m in melody_chroma_matrices], axis=0
-        )
-    else:
-        # No melody - use zeros for melody chroma
-        chroma_mel_matrix = np.zeros((12, min_frames))
-
-    # Compute harmony chroma matrix
-    if has_harmony:
-        # Average harmony chroma matrices
-        chroma_harm_matrix = np.mean(
-            [m[:, :min_frames] for m in harmony_chroma_matrices], axis=0
-        )
-    else:
-        # No harmony - use zeros for harmony chroma
-        chroma_harm_matrix = np.zeros((12, min_frames))
-
-    # --- 4. Prepare signals for rhythm calculation ---
-    # Mix all available signals
-    all_signals = melody_signals + harmony_signals
-    min_signal_length = min(sig.shape[0] for sig in all_signals)
-    mixed_signals = [sig[:min_signal_length] for sig in all_signals]
-
-    # --- 5. Calculate Rhythmic Density (1 dim) ---
-    # Create unified mixed signal from available clips
-    y_mix = np.sum(mixed_signals, axis=0)
-
-    # Calculate Onset Strength Function
-    o_env = librosa.onset.onset_strength(y=y_mix, sr=sr, hop_length=hop_length)
-
-    # Truncate and reshape density vector for concatenation
-    rhythm_density_vector = o_env[:min_frames]
-    rhythm_density_matrix = rhythm_density_vector[np.newaxis, :]
-
-    # --- 6. Concatenate Features ---
-    feature_matrix = np.vstack(
-        [chroma_mel_matrix, chroma_harm_matrix, rhythm_density_matrix]
+    chroma_mel  = (
+        np.mean([m[:, :min_frames] for m in melody_chroma_matrices], axis=0)
+        if has_melody else np.zeros((12, min_frames))
+    )
+    chroma_harm = (
+        np.mean([m[:, :min_frames] for m in harmony_chroma_matrices], axis=0)
+        if has_harmony else np.zeros((12, min_frames))
     )
 
-    return feature_matrix
+    # --- Rhythmic density (1 dim) ---
+    all_signals     = melody_signals + harmony_signals
+    min_len         = min(s.shape[0] for s in all_signals)
+    y_mix           = np.sum([s[:min_len] for s in all_signals], axis=0)
+    onset_env       = librosa.onset.onset_strength(y=y_mix, sr=sr, hop_length=hop_length)
+    rhythm_matrix   = onset_env[:min_frames][np.newaxis, :]
 
+    return np.vstack([chroma_mel, chroma_harm, rhythm_matrix])  # (25, T_frames)
+
+
+def extract_bar_feature_vector(
+    melody_clips: Optional[List[np.ndarray]],
+    harmony_clips: Optional[List[np.ndarray]],
+    sr: int = 22050,
+) -> np.ndarray:
+    """
+    Extract a single 25-dim feature vector for one bar position.
+
+    Mean-pools the time-series matrix along the frame axis so the result
+    is a fixed-size descriptor regardless of bar length. This is the input
+    format expected by the VQ-VAE encoder.
+
+    Args:
+        melody_clips:   List of bar-length audio arrays for melody stems
+        harmony_clips:  List of bar-length audio arrays for harmony stems
+        sr:             Sample rate
+
+    Returns:
+        (25,) float32 numpy array
+    """
+    matrix = extract_feature_matrix(
+        main_melody    = np.array(melody_clips,  dtype=object) if melody_clips  else None,
+        harmonic_clips = np.array(harmony_clips, dtype=object) if harmony_clips else None,
+        sr             = sr,
+    )
+    return matrix.mean(axis=1).astype(np.float32)  # (25, T) → (25,)

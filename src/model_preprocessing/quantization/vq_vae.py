@@ -1,232 +1,181 @@
+"""
+Vector Quantized Variational Autoencoder.
+
+Maps 25-dim bar feature vectors to discrete codebook indices.
+One index per bar = one token in the arrangement sequence.
+
+Architecture:
+    Encoder: MLP  input_dim → hidden → emb_dim
+    Codebook: NearestEmbed  (codebook_size entries of emb_dim each)
+    Decoder: MLP  emb_dim → hidden → input_dim
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+from typing import Tuple, Dict
+
 from src.model_preprocessing.quantization.nearest_embed import NearestEmbed
 
 
 class VQ_VAE(nn.Module):
-    """Vector Quantized AutoEncoder"""
-    def __init__(self, hidden=200, k=10, vq_coef=0.2, comit_coef=0.4, input_size=None, batch_size=None):
-        super(VQ_VAE, self).__init__()
 
-        self.emb_size = k
-        self.input_size = input_size
-        self.batch_size = batch_size
-        self.hidden = hidden
-        self.vq_coef = vq_coef
-        self.comit_coef = comit_coef
-        self.ce_loss = 0
-        self.vq_loss = 0
-        self.commit_loss = 0
-        self.encoder_spatial_shape = None
-        self.fc1 = nn.Linear(self.input_size, 400)
-        self.fc2 = nn.Linear(3200, hidden)
-        self.fc_bottleneck = nn.Linear(hidden, self.emb_size)  # Encoder bottleneck: 200 -> 10
-        self.fc_expand = nn.Linear(self.emb_size, hidden)  # Decoder expansion: 10 -> 200
-        self.fc3 = nn.Linear(hidden, 3200)
-        self.decoder_fc1 = nn.Linear(100, 400)
-        self.fc4 = nn.Linear(400, self.input_size)
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.decoder_conv1 = nn.ConvTranspose2d(128, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.decoder_conv2 = nn.ConvTranspose2d(64, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
-        self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
-        self.emb = NearestEmbed(k, self.emb_size)
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
-        self.tanh = nn.Tanh()
-
-    def encode(self, x):
-        batch_size = x.shape[0]
-        h1 = self.relu(self.fc1(x))
-        print("shape after fc1 and relu:", h1.shape)
-        h2 = self.relu(self.conv1(h1.view(batch_size, 1, 20, 20)))
-        print("shape after conv1 and relu:", h2.shape)
-        h3 = self.pool1(h2)
-        print("shape after pool1:", h3.shape)
-        h4 = self.relu(self.conv2(h3))
-        print("shape after conv2 and relu:", h4.shape)
-        h5 = self.pool2(h4)
-        print("shape after pool2:", h5.shape)
-        self.encoder_spatial_shape = h5.shape[1:]
-        h6 = self.relu(self.fc2(h5.view(batch_size, -1)))
-        print("shape after fc2:", h6.shape)
-        h7 = self.fc_bottleneck(h6)
-        print("shape after bottleneck:", h7.shape)
-        return h7.view(batch_size, self.emb_size)
-
-    def decode(self, z):
-        batch_size = z.shape[0]
-        print("shape of z in decode:", z.shape)
-        d0 = self.relu(self.fc_expand(z))
-        print("shape after expand:", d0.shape)
-        d1 = self.relu(self.fc3(d0))
-        print("shape after fc3 and relu:", d1.shape)
-        d2 = d1.view(batch_size, *self.encoder_spatial_shape)
-        print("shape after reshaping d1:", d2.shape)
-        d3 = F.interpolate(d2, scale_factor=(1, 2), mode='nearest')
-        print("shape after interpolation 1:", d3.shape)
-        d4 = self.relu(self.decoder_conv1(d3))
-        print("shape after decoder conv1 and relu:", d4.shape)
-        d5 = F.interpolate(d4, scale_factor=(1, 2), mode='nearest')
-        print("shape after interpolation 2:", d5.shape)
-        d6 = self.decoder_conv2(d5)
-        print("shape after decoder conv2:", d6.shape)
-        d7 = d6.view(batch_size, -1)
-        print("shape after flattening d6:", d7.shape)
-        d8 = self.relu(self.decoder_fc1(d7))
-        print("shape after decoder fc1 and relu:", d8.shape)
-        d9 = self.fc4(d8)
-        print("shape after final fc4:", d9.shape)
-        return self.tanh(d9)
-
-    def forward(self, x):
-        z_e = self.encode(x)
-        z_q, _ = self.emb(z_e, weight_sg=True)
-        print("shape of z_q before decode:", z_q.shape)
-        emb, _ = self.emb(z_e.detach())
-        z_q = z_q.view(-1, self.emb_size)
-
-        return self.decode(z_q), z_e, emb
-
-    def sample(self, size):
-        sample = torch.randn(size, self.emb_size,
-                             int(self.hidden / self.emb_size))
-        if self.cuda():
-            sample = sample.cuda()
-        emb, _ = self.emb(sample)
-        sample = self.decode(emb(sample).view(-1, self.hidden)).cpu()
-        return sample
-
-    def loss_function(self, x, recon_x, z_e, emb):
-        self.ce_loss = F.mse_loss(recon_x, x)
-        self.vq_loss = F.mse_loss(emb, z_e.detach())
-        self.commit_loss = F.mse_loss(z_e, emb.detach())
-        return self.ce_loss + self.vq_coef * self.vq_loss + self.comit_coef * self.commit_loss
-
-    def latest_losses(self):
-        return {'cross_entropy': self.ce_loss, 'vq': self.vq_loss, 'commitment': self.commit_loss}#
-    
-    def quantized_forward_pass(self, x):
-        """Forward pass that returns quantized embeddings for input x."""
-        z_e = self.encode(x)
-        z_q, _ = self.emb(z_e, weight_sg=True)
-        # Need to return the actual codes not the vectors themselves.
-        return z_q
-
-class VQ_VAE_TRAINER(nn.Module):
-
-    def __init__(self, vq_vae_model):
-        super().__init__()
-        self.vq_vae = vq_vae_model
-
-    def forward(self, x):
-        recon_x, z_e, emb = self.vq_vae(x)
-        loss = self.vq_vae.loss_function(x, recon_x, z_e, emb)
-        return recon_x, loss
-
-    def model_train_step(self, x, optimizer):
-        self.train()
-        optimizer.zero_grad()
-        recon_x, loss = self.forward(x)
-        loss.backward()
-        optimizer.step()
-        return recon_x, loss
-    def model_eval_step(self, x):
-        self.eval()
-        with torch.no_grad():
-            recon_x, loss = self.forward(x)
-        return recon_x, loss
-    def extract_vectors_categories(self):
+    def __init__(
+        self,
+        input_dim: int = 25,
+        hidden_dim: int = 128,
+        codebook_size: int = 64,
+        emb_dim: int = 32,
+        vq_coef: float = 0.2,
+        commit_coef: float = 0.4,
+    ):
         """
-        Extract the learned codebook embeddings.
+        Args:
+            input_dim:      Feature vector size (25 = 12 mel chroma + 12 harm chroma + 1 onset)
+            hidden_dim:     MLP hidden layer width
+            codebook_size:  Number of discrete codes (vocabulary size before special tokens)
+            emb_dim:        Codebook entry dimensionality (latent bottleneck)
+            vq_coef:        Weight for VQ loss term
+            commit_coef:    Weight for commitment loss term
+        """
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.emb_dim = emb_dim
+        self.codebook_size = codebook_size
+        self.vq_coef = vq_coef
+        self.commit_coef = commit_coef
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, emb_dim),
+        )
+
+        self.codebook = NearestEmbed(codebook_size, emb_dim)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(emb_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+
+    # ------------------------------------------------------------------
+    # Core forward passes
+    # ------------------------------------------------------------------
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (batch, input_dim) → z_e: (batch, emb_dim)"""
+        return self.encoder(x)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (batch, emb_dim) → x_recon: (batch, input_dim)"""
+        return self.decoder(z)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Full forward pass used during training.
 
         Returns:
-            torch.Tensor: Codebook embeddings of shape (emb_dim, num_embeddings)
+            x_recon:  (batch, input_dim)  reconstructed input
+            z_e:      (batch, emb_dim)    encoder output (pre-quantization)
+            emb:      (batch, emb_dim)    quantized vector (straight-through, detached codebook)
+        """
+        z_e = self.encode(x)
+        z_q, _ = self.codebook(z_e, weight_sg=True)   # straight-through: grad flows to encoder
+        emb, _ = self.codebook(z_e.detach())           # for VQ loss: codebook learns toward z_e
+        x_recon = self.decode(z_q)
+        return x_recon, z_e, emb
+
+    # ------------------------------------------------------------------
+    # Loss
+    # ------------------------------------------------------------------
+
+    def loss(
+        self,
+        x: torch.Tensor,
+        x_recon: torch.Tensor,
+        z_e: torch.Tensor,
+        emb: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        VQ-VAE loss = reconstruction + VQ + commitment.
+
+        Returns:
+            total_loss: scalar tensor
+            breakdown:  dict with individual loss values for logging
+        """
+        recon_loss  = F.mse_loss(x_recon, x)
+        vq_loss     = F.mse_loss(emb, z_e.detach())
+        commit_loss = F.mse_loss(z_e, emb.detach())
+        total       = recon_loss + self.vq_coef * vq_loss + self.commit_coef * commit_loss
+
+        return total, {
+            "recon":  recon_loss.item(),
+            "vq":     vq_loss.item(),
+            "commit": commit_loss.item(),
+        }
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def encode_to_indices(self, x: torch.Tensor, batch_size: int = 512) -> torch.Tensor:
+        """
+        Encode a batch of feature vectors to integer codebook indices.
+
+        Args:
+            x:          (N, input_dim) feature vectors
+            batch_size: chunk size to avoid OOM on large datasets
+
+        Returns:
+            indices: (N,) long tensor, values in [0, codebook_size)
         """
         self.eval()
-        return self.vq_vae.emb.weight.detach().clone()
+        all_indices = []
+        for i in range(0, len(x), batch_size):
+            batch = x[i : i + batch_size]
+            z_e = self.encode(batch)
+            _, idx = self.codebook(z_e)
+            all_indices.append(idx)
+        return torch.cat(all_indices)
 
-    def save_model_weights(self, save_path: str):
-        """
-        Save the model weights to a file.
-
-        Args:
-            save_path: Path to save the model weights
-        """
-        torch.save(self.vq_vae.state_dict(), save_path)
-        print(f"Saved model weights to {save_path}")
-    def save_embeddings(self, save_path: str):
-        """
-        Save the learned codebook embeddings to a file.
-
-        Args:
-            save_path: Path to save the embeddings
-        """
-        embeddings = self.extract_vectors_categories()
-        torch.save({
-            'embeddings': embeddings,
-            'emb_size': self.vq_vae.emb_size,
-            'hidden': self.vq_vae.hidden,
-        }, save_path)
-        print(f"Saved embeddings of shape {embeddings.shape} to {save_path}")
-
-    def load_embeddings(self, load_path: str):
-        """
-        Load previously saved embeddings into the model.
-
-        Args:
-            load_path: Path to load the embeddings from
-        """
-        checkpoint = torch.load(load_path)
-        self.vq_vae.emb.weight.data = checkpoint['embeddings']
-        print(f"Loaded embeddings of shape {checkpoint['embeddings'].shape} from {load_path}")
-    
-    def full_training_sequence(self,train_loader,optimizer,num_epochs):
-        for epoch in range(num_epochs):
-            total_loss = 0
-            for batch_idx, data in enumerate(train_loader):
-                inputs = data
-                recon_x, loss = self.model_train_step(inputs, optimizer)
-                total_loss += loss.item()
-            avg_loss = total_loss / len(train_loader)
-            print(f"Epoch [{epoch+1}/{num_epochs}], Average Loss: {avg_loss:.4f}")
-    
-    def full_evaluation_sequence(self,path_to_data,train_loader):
-        """ All training data loaded and original vectors quantized after training and saved to relevant folder."""
-        total_loss = 0
-        with torch.no_grad():
-            for batch_idx, data in enumerate(train_loader):
-                inputs = data
-                vector = self.vq_vae.quantized_forward_pass(inputs)
-                np_vector = vector.to_numpy()
-                np.savez_compressed(f"{path_to_data}/quantized_chunk_{batch_idx}.npz",quantized_indices=np_vector)
+    def get_codebook_vectors(self) -> torch.Tensor:
+        """Returns (codebook_size, emb_dim) codebook weight matrix."""
+        return self.codebook.weight.detach().t()
 
 
-if __name__ == "__main__":
-    model = VQ_VAE(input_size=500, batch_size=20)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    x = torch.randn(500, 25, 128)
-    x_reshaped = x.view(x.shape[0], -1)
-    model = VQ_VAE(input_size=x_reshaped.shape[1], batch_size=x_reshaped.shape[0])
+class VQ_VAE_TRAINER:
+    """Training wrapper for VQ_VAE."""
 
-    for i in range(1):
-        for start_len in range(1):
-            print(f"Iteration {i}, Batch {start_len}")
-            x_reshaped = x[start_len*50:(start_len+1)*50].view(50, -1)
-            recon_x, z_e, emb = model(x_reshaped)
-            print("Reconstructed x shape:", recon_x.shape)
-            print("Encoded z_e shape:", z_e.shape)
-            print("Embedding shape:", emb.shape)
-            print("Original x shape:", x_reshaped.shape)
-            loss = model.loss_function(x_reshaped, recon_x, z_e, emb)
-            print("Loss:", loss.item())
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    def __init__(self, model: VQ_VAE, lr: float = 1e-3, device: torch.device = None):
+        self.model = model
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    def step(self, x: torch.Tensor) -> Dict[str, float]:
+        """Single training step. Returns loss breakdown."""
+        self.model.train()
+        x = x.to(self.device)
 
-        
+        x_recon, z_e, emb = self.model(x)
+        loss, breakdown = self.model.loss(x, x_recon, z_e, emb)
 
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        breakdown["total"] = loss.item()
+        return breakdown
+
+    def save(self, path: str) -> None:
+        torch.save(self.model.state_dict(), path)
+
+    def load(self, path: str) -> None:
+        self.model.load_state_dict(torch.load(path, map_location=self.device))

@@ -4,3 +4,4 @@
 **/*.pyc
 .claude*
 /test_notebooks/
+docs/

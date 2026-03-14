@@ -17,7 +17,7 @@ Stage 3 (Transformer):
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union, Iterator
 
 import numpy as np
 import torch
@@ -310,16 +310,149 @@ class ArrangementTrainer:
         print(f"  Saved → {path}")
 
     # ------------------------------------------------------------------
+    # Token sequence generation (for streaming)
+    # ------------------------------------------------------------------
+
+    def _token_sequences_generator(
+        self, songs_iterator: Iterator[SongData]
+    ) -> Iterator[List[int]]:
+        """
+        Generator that yields token sequences (one per song).
+
+        Takes streaming songs and encodes each bar to a token.
+
+        Args:
+            songs_iterator: Iterator[SongData] from HF or local
+
+        Yields:
+            List[int]: Token sequence for one song
+        """
+        assert self.vq_vae is not None, "Train VQ-VAE first."
+
+        for song in songs_iterator:
+            if not song.is_valid():
+                continue
+
+            tokens = []
+            for bar_idx in range(song.num_bars):
+                mel = song.melody_clips_at(bar_idx)
+                harm = song.harmony_clips_at(bar_idx)
+
+                vec = extract_bar_feature_vector(mel, harm, song.sr)
+                vec_t = torch.from_numpy(vec).unsqueeze(0).to(self.device)
+
+                # Encode single feature to token
+                idx = self.vq_vae.encode_to_indices(vec_t, batch_size=1)
+                token = int(idx[0].item()) + self.config.num_special_tokens
+                tokens.append(token)
+
+            yield tokens
+
+    # ------------------------------------------------------------------
+    # Transformer training (streaming variant)
+    # ------------------------------------------------------------------
+
+    def train_transformer_streaming(self, song_sequences_iterator: Iterator[List[int]]) -> None:
+        """
+        Train Transformer on streaming token sequences (SINGLE EPOCH ONLY).
+
+        ⚠️ WARNING: IterableDataset can only be iterated once. This method
+        trains for only 1 epoch, not config.transformer_epochs epochs!
+
+        Use this method ONLY if:
+        - You have a very large dataset that doesn't fit in memory
+        - You're OK with single-epoch training
+        - You're using it for quick validation/testing
+
+        For production training with multiple epochs, use train_transformer()
+        instead, which buffered token sequences into memory first.
+
+        Args:
+            song_sequences_iterator: Iterator yielding token lists (one per song)
+        """
+        from src.dataloaders.music_dataset import TokenSequenceDataset
+
+        cfg = self.config
+        self.transformer = self._build_transformer().to(self.device)
+        optimizer = torch.optim.Adam(self.transformer.parameters(), lr=cfg.transformer_lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.transformer_epochs
+        )
+
+        # Wrap iterator in dataset
+        dataset = TokenSequenceDataset(
+            song_sequences_iterator,
+            bos_idx=cfg.bos_idx,
+            eos_idx=cfg.eos_idx
+        )
+
+        # Custom collate function for padding
+        def collate_fn(seqs):
+            padded = pad_sequence(seqs, batch_first=True, padding_value=cfg.pad_idx)
+            masks = (padded != cfg.pad_idx).long()
+            return padded, masks
+
+        loader = DataLoader(
+            dataset,
+            batch_size=cfg.transformer_batch_size,
+            collate_fn=collate_fn
+        )
+
+        print(f"  Transformer: streaming sequences, {cfg.transformer_epochs} epochs")
+        for epoch in range(cfg.transformer_epochs):
+            self.transformer.train()
+            total_loss = 0.0
+            batch_count = 0
+
+            for seqs, attn_masks in loader:
+                seqs = seqs.to(self.device)
+                attn_masks = attn_masks.to(self.device)
+
+                targets = seqs.clone()
+                targets[attn_masks == 0] = -100
+
+                optimizer.zero_grad()
+                loss = self.transformer.compute_loss(seqs, targets, attn_masks)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.transformer.parameters(), 1.0)
+                optimizer.step()
+                total_loss += loss.item()
+                batch_count += 1
+
+            scheduler.step()
+
+            if (epoch + 1) % 10 == 0:
+                avg_loss = total_loss / batch_count if batch_count > 0 else 0.0
+                print(
+                    f"    epoch {epoch+1:>3}/{cfg.transformer_epochs}"
+                    f"  loss={avg_loss:.4f}"
+                )
+
+            if (epoch + 1) % cfg.save_every_n_epochs == 0:
+                self._save_transformer_checkpoint(epoch + 1)
+
+        self._save_transformer_checkpoint("final")
+
+    # ------------------------------------------------------------------
     # Full pipeline
     # ------------------------------------------------------------------
 
-    def train(self, songs: List[SongData]) -> None:
+    def train(self, songs: Union[List[SongData], Iterator[SongData]]) -> None:
         """
         Run the full training pipeline on a list of SongData objects.
+
+        Accepts either:
+          - List[SongData] (all in memory)
+          - Iterator[SongData] (streaming from HF)
 
         Args:
             songs: produced by the data loading layer (HF or local)
         """
+        # Convert iterator to list if needed (for multiple passes)
+        if hasattr(songs, '__iter__') and not hasattr(songs, '__len__'):
+            # It's an iterator - convert to list
+            songs = list(songs)
+
         valid = [s for s in songs if s.is_valid()]
         print(f"Training on {len(valid)}/{len(songs)} valid songs.")
 
@@ -338,6 +471,53 @@ class ArrangementTrainer:
         print("\n[3/3] Training Transformer...")
         self.train_transformer(song_sequences)
 
+        print("\nTraining complete.")
+
+    def train_streaming(self, songs_iterator: Iterator[SongData]) -> None:
+        """
+        Streaming training pipeline (two passes through data).
+
+        Pass 1: Stream songs, extract features, train VQ-VAE
+        Pass 2: Encode to tokens, train Transformer (regular, not streaming)
+
+        Note: Unlike train_transformer_streaming(), this uses regular training
+        because we need multiple epochs over the same data.
+
+        Args:
+            songs_iterator: Iterator[SongData] (from HF or local)
+        """
+        print("\n[1/3] Pass 1: Streaming songs, extracting features...")
+        features_list = []
+        metadata_list = []
+
+        for song in songs_iterator:
+            if not song.is_valid():
+                continue
+
+            for bar_idx in range(song.num_bars):
+                mel = song.melody_clips_at(bar_idx)
+                harm = song.harmony_clips_at(bar_idx)
+
+                vec = extract_bar_feature_vector(mel, harm, song.sr)
+                features_list.append(vec)
+                metadata_list.append((song.song_id, bar_idx))
+
+        features = np.array(features_list, dtype=np.float32)
+        print(f"      {len(features)} bar feature vectors")
+
+        print("\n[2/3] Training VQ-VAE...")
+        self.train_vq_vae(features)
+
+        # Encode to token sequences
+        print("\n[  ] Encoding token sequences...")
+        song_sequences = self._encode_to_token_sequences(features, metadata_list)
+        lengths = [len(s) for s in song_sequences.values()]
+        print(f"      {len(song_sequences)} sequences, avg length {np.mean(lengths):.1f}")
+
+        print("\n[3/3] Training Transformer...")
+        # Use regular transformer training (supports multiple epochs)
+        # Do NOT use train_transformer_streaming() - that's for true streaming
+        self.train_transformer(song_sequences)
         print("\nTraining complete.")
 
     # ------------------------------------------------------------------

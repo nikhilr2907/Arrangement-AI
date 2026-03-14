@@ -16,12 +16,24 @@ class HFStreamingLoader:
     """
     Stream SongData objects from HuggingFace parquet dataset.
 
-    Expected parquet columns:
-      - song_id: str
-      - melody_audio: bytes (float32 audio data)
-      - harmony_audio: bytes (float32 audio data)
-      - sr: int (sample rate)
-      - bpm: float (tempo in BPM)
+    Dynamically discovers all stem columns. Expected parquet structure:
+      Required columns:
+        - song_id: str
+        - sr: int (sample rate)
+        - bpm: float (tempo in BPM)
+
+      Audio stem columns (any number, named flexibly):
+        - *_audio: bytes (float32 audio data)
+          Examples: melody_audio, harmony_1_audio, drums_audio, bass_audio, etc.
+
+      Optional type columns (explicit stem classification):
+        - *_type: str (melody/harmony/drums)
+          Examples: melody_type, harmony_1_type, drums_type, etc.
+
+    If *_type columns are not provided, stem types are inferred from names:
+      - "melody", "vocal", "lead", "voice" → melody
+      - "drum", "percussion", "kick", "snare" → drums
+      - "harmony", "bass", "synth", "pad", "guitar" → harmony
 
     Usage:
         loader = HFStreamingLoader("username/dataset_name", split="train")
@@ -44,6 +56,9 @@ class HFStreamingLoader:
         """
         Stream SongData objects one at a time from HF dataset.
 
+        Dynamically discovers all *_audio columns and loads them as stems.
+        Stem types are either read from *_type columns or inferred from names.
+
         Yields:
             SongData: Processed song with bars extracted
         """
@@ -56,21 +71,41 @@ class HFStreamingLoader:
 
         for row in dataset:
             try:
-                # Convert bytes back to numpy arrays
-                melody_audio = np.frombuffer(row["melody_audio"], dtype=np.float32)
-                harmony_audio = np.frombuffer(row["harmony_audio"], dtype=np.float32)
+                # Dynamically discover all *_audio columns (not hardcoded)
+                stems = {}
+                stem_types = {}
 
-                stems = {
-                    "melody": melody_audio,
-                    "harmony": harmony_audio,
-                }
+                for key in row.keys():
+                    if key.endswith("_audio"):
+                        stem_name = key.replace("_audio", "")
+
+                        # Convert bytes to numpy array
+                        audio_bytes = row[key]
+                        if audio_bytes is None:
+                            continue
+
+                        stems[stem_name] = np.frombuffer(
+                            audio_bytes, dtype=np.float32
+                        ).copy()
+
+                        # Try to get explicit type from *_type column
+                        type_key = f"{stem_name}_type"
+                        if type_key in row and row[type_key] is not None:
+                            stem_types[stem_name] = row[type_key]
+                        else:
+                            # Fall back to inferring from stem name
+                            stem_types[stem_name] = self._infer_stem_type(stem_name)
+
+                if not stems:
+                    print(f"  [WARNING] {row.get('song_id', 'unknown')}: No audio stems found")
+                    continue
 
                 song_data = self.processor.process(
                     stems=stems,
                     song_id=row["song_id"],
                     sr=row["sr"],
                     bpm=row["bpm"],
-                    stem_types={"melody": "melody", "harmony": "harmony"}
+                    stem_types=stem_types if stem_types else None
                 )
 
                 if song_data.is_valid():
@@ -78,3 +113,30 @@ class HFStreamingLoader:
             except Exception as e:
                 print(f"  [WARNING] Error processing {row.get('song_id', 'unknown')}: {e}")
                 continue
+
+    def _infer_stem_type(self, stem_name: str) -> str:
+        """
+        Infer stem type from stem name if not provided explicitly.
+
+        Args:
+            stem_name: Name of the stem (e.g., "melody", "harmony_1", "drums")
+
+        Returns:
+            "melody", "harmony", or "drums" based on naming conventions
+        """
+        name_lower = stem_name.lower()
+
+        # Melody detection
+        if any(x in name_lower for x in ["melody", "vocal", "lead", "main", "voice", "singer"]):
+            return "melody"
+
+        # Drums/percussion detection
+        if any(x in name_lower for x in ["drum", "kick", "percussion", "beat", "snare", "cymbal"]):
+            return "drums"
+
+        # Harmony detection (includes bass, synth, guitar, strings, etc.)
+        if any(x in name_lower for x in ["harmony", "bass", "synth", "pad", "chord", "guitar", "strings", "instrumental"]):
+            return "harmony"
+
+        # Default to harmony for anything else (safe fallback)
+        return "harmony"

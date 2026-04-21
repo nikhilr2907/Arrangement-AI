@@ -2,12 +2,12 @@
 StemProcessor — core in-memory stem processing pipeline.
 
 Takes raw audio stems in memory and produces a SongData object.
-No file I/O, no temporary files.
+No file I/O, no temporary files. No melody/harmony classification —
+all stems are treated uniformly.
 
 Stages:
   1. Beat detection and bar extraction (using BPM if available)
-  2. Stem classification (melody vs harmony from metadata or auto-classify)
-  3. SongData assembly
+  2. SongData assembly
 """
 
 from typing import Dict, Optional
@@ -18,7 +18,6 @@ from src.audio_training_breakdown_automation.audio_breakdown import (
     generate_beats_from_tempo,
     detect_beats,
     extract_bars,
-    classify_stems,
 )
 from src.song_data import SongData
 
@@ -30,10 +29,10 @@ class StemProcessor:
     Usage:
         processor = StemProcessor()
         song_data = processor.process(
-            stems = {"melody": audio_array, "bass": audio_array, ...},
+            stems  = {"guitar": audio_array, "bass": audio_array, ...},
             song_id = "song_001",
-            sr = 22050,
-            bpm = 120.0,
+            sr      = 22050,
+            bpm     = 120.0,
         )
     """
 
@@ -42,32 +41,27 @@ class StemProcessor:
 
     def process(
         self,
-        stems: Dict[str, np.ndarray],
+        stems:   Dict[str, np.ndarray],
         song_id: str,
-        sr: int,
-        bpm: float,
-        stem_types: Optional[Dict[str, str]] = None,
-        activity_threshold: float = 0.5,
+        sr:      int,
+        bpm:     float,
     ) -> SongData:
         """
         Process stems into SongData.
 
         Args:
-            stems:              {stem_name: audio_array (mono or stereo)}
-            song_id:            unique song identifier
-            sr:                 sample rate
-            bpm:                tempo in beats per minute
-            stem_types:         optional {stem_name: 'melody' or 'harmony'} from metadata
-            activity_threshold: fallback auto-classification threshold (0-1)
+            stems:   {stem_name: audio_array (mono or stereo)}
+            song_id: unique song identifier
+            sr:      sample rate
+            bpm:     tempo in beats per minute (pass 0 or None to use librosa detection)
 
         Returns:
             SongData object ready for training/inference
         """
-        # Normalize to mono if needed
+        # Normalise to mono if needed
         stems_mono = {}
         for name, audio in stems.items():
             if audio.ndim > 1:
-                # Stereo or multi-channel → mix to mono
                 audio = np.mean(audio, axis=0)
             stems_mono[name] = audio.astype(np.float32)
 
@@ -75,48 +69,28 @@ class StemProcessor:
         beat_frames = self._extract_beat_frames(stems_mono, sr, bpm)
 
         # Bar extraction per stem
-        stem_bars = {}
+        all_stems = []
         for name, audio in stems_mono.items():
             bars = extract_bars(audio, beat_frames, self.beats_per_bar)
             if bars:
-                stem_bars[name] = bars
+                all_stems.append(bars)
 
-        if not stem_bars:
+        if not all_stems:
             raise ValueError(f"No bars extracted from stems for {song_id}")
 
-        # Stem classification
-        melody_stems, harmony_stems = classify_stems(
-            stem_bars, stem_types=stem_types, activity_threshold=activity_threshold
-        )
-
-        # Build SongData
         return SongData(
-            song_id=song_id,
-            melody_stems=list(melody_stems.values()),
-            harmony_stems=list(harmony_stems.values()),
-            sr=sr,
+            song_id = song_id,
+            stems   = all_stems,
+            sr      = sr,
         )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _extract_beat_frames(
         self, stems: Dict[str, np.ndarray], sr: int, bpm: float
     ) -> np.ndarray:
-        """
-        Extract beat frames from stems.
-
-        Uses BPM directly if provided (preferred).
-        Falls back to librosa beat detection if BPM is None (less reliable).
-        """
-        # Use BPM if available (much more reliable than librosa detection)
         if bpm is not None and bpm > 0:
-            # Pick one stem to determine duration, use BPM for beat generation
             first_stem = next(iter(stems.values()))
             return generate_beats_from_tempo(first_stem, sr, bpm)
         else:
-            # Fallback: detect from audio (can be unreliable on mixed/complex stems)
             first_stem = next(iter(stems.values()))
-            tempo, beat_frames = detect_beats(first_stem, sr)
+            _, beat_frames = detect_beats(first_stem, sr)
             return beat_frames

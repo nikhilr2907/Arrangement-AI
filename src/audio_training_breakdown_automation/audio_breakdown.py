@@ -4,7 +4,6 @@ Audio stem segmentation into bars.
 Core functions for in-memory audio processing:
   - Beat detection and frame extraction
   - Bar segmentation from beat frames
-  - Stem classification (melody vs harmony)
 """
 
 from typing import Dict, List, Tuple
@@ -12,12 +11,48 @@ from typing import Dict, List, Tuple
 import librosa
 import numpy as np
 
-from src.latent_preprocessing.melodic_candidates import find_melodic_candidates
+
+def score_drum_likelihood(audio_array: np.ndarray, sr: int) -> float:
+    """
+    Score how drum-like a stem is using percussive energy ratio and onset density.
+
+    Returns a value in [0, 1] — higher means more drum-like.
+    """
+    _, percussive = librosa.effects.hpss(audio_array)
+
+    total_energy      = np.sum(audio_array ** 2) + 1e-8
+    percussive_energy = np.sum(percussive ** 2)
+    percussive_ratio  = percussive_energy / total_energy
+
+    duration_s    = len(audio_array) / sr
+    onsets        = librosa.onset.onset_detect(y=audio_array, sr=sr)
+    onset_density = min(len(onsets) / (duration_s + 1e-8) / 10.0, 1.0)
+
+    return 0.7 * percussive_ratio + 0.3 * onset_density
 
 
-# ---------------------------------------------------------------------------
-# Beat and bar extraction (work with numpy arrays, no file I/O)
-# ---------------------------------------------------------------------------
+def find_drum_stem(
+    stems: Dict[str, np.ndarray],
+    sr: int,
+) -> Tuple[str, np.ndarray]:
+    """
+    Identify the most drum-like stem from a dict of {stem_name: audio_array}.
+
+    Returns (stem_name, audio_array) of the highest-scoring stem.
+    """
+    best_name  = None
+    best_audio = None
+    best_score = -1.0
+
+    for name, audio in stems.items():
+        score = score_drum_likelihood(audio, sr)
+        if score > best_score:
+            best_score = score
+            best_name  = name
+            best_audio = audio
+
+    return best_name, best_audio
+
 
 def generate_beats_from_tempo(
     audio_array: np.ndarray,
@@ -81,8 +116,8 @@ def extract_bars(
     Extract bar-length audio segments from beat frames.
 
     Args:
-        audio_array:  audio samples
-        beat_frames:  frame indices of beats
+        audio_array:   audio samples
+        beat_frames:   frame indices of beats
         beats_per_bar: beats per measure (typically 4)
 
     Returns:
@@ -93,52 +128,7 @@ def extract_bars(
 
     for i in range(len(bar_indices) - 1):
         start_sample = librosa.frames_to_samples(bar_indices[i])
-        end_sample = librosa.frames_to_samples(bar_indices[i + 1])
+        end_sample   = librosa.frames_to_samples(bar_indices[i + 1])
         bars.append(audio_array[start_sample:end_sample])
 
     return bars
-
-
-# ---------------------------------------------------------------------------
-# Stem classification
-# ---------------------------------------------------------------------------
-
-def classify_stems(
-    stem_bars: Dict[str, List[np.ndarray]],
-    stem_types: Dict[str, str] = None,
-    activity_threshold: float = 0.5,
-) -> Tuple[Dict[str, List[np.ndarray]], Dict[str, List[np.ndarray]]]:
-    """
-    Separate stems into melody and harmony groups.
-
-    Args:
-        stem_bars:          {stem_name: [bar_1, bar_2, ...]}
-        stem_types:         optional {stem_name: 'melody' or 'harmony'} from metadata
-        activity_threshold: fallback threshold for auto-classification (0-1)
-
-    Returns:
-        (melody_stems, harmony_stems) dicts with same structure as stem_bars
-    """
-    melody_stems = {}
-    harmony_stems = {}
-
-    # If stem types are provided in metadata, use those
-    if stem_types:
-        for stem_name, bars in stem_bars.items():
-            if stem_types.get(stem_name) == "melody":
-                melody_stems[stem_name] = bars
-            else:
-                harmony_stems[stem_name] = bars
-    else:
-        # Fallback: auto-classify by activity
-        active_stems = find_melodic_candidates(
-            {k: np.array(v, dtype=object) for k, v in stem_bars.items()},
-            activity_threshold=activity_threshold,
-        )
-        for stem_name, bars in stem_bars.items():
-            if stem_name in active_stems:
-                melody_stems[stem_name] = bars
-            else:
-                harmony_stems[stem_name] = bars
-
-    return melody_stems, harmony_stems

@@ -14,7 +14,7 @@ the nearest token by codebook L2 distance is used instead.
 
 import random
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
 import numpy as np
@@ -26,35 +26,25 @@ from src.song_data import SongData
 from src.training_code.arrangement_trainer import TrainingConfig
 
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
 @dataclass
 class ClipEntry:
     """One available clip combination at a specific bar position."""
-    song_id:       str
-    bar_idx:       int
-    melody_clips:  List[np.ndarray]
-    harmony_clips: List[np.ndarray]
-    feature_vec:   np.ndarray        # (25,) for fallback distance lookup
-    token:         int               # offset token (>= num_special_tokens)
+    song_id:    str
+    bar_idx:    int
+    clips:      List[np.ndarray]   # all stem clips at this bar
+    feature_vec: np.ndarray        # (25,) for fallback distance lookup
+    token:      int                # offset token (>= num_special_tokens)
 
 
 @dataclass
 class ArrangementBar:
     """One bar of a generated arrangement."""
-    bar_position:  int
-    token:         int
-    melody_clips:  List[np.ndarray]
-    harmony_clips: List[np.ndarray]
+    bar_position:   int
+    token:          int
+    clips:          List[np.ndarray]
     source_song_id: str
     source_bar_idx: int
 
-
-# ---------------------------------------------------------------------------
-# StemLibrary
-# ---------------------------------------------------------------------------
 
 class StemLibrary:
     """
@@ -62,15 +52,15 @@ class StemLibrary:
 
     Usage:
         library = StemLibrary(vq_vae, config)
-        library.index(songs)          # songs: List[SongData]
-        entry  = library.query(token) # → ClipEntry
+        library.index(songs)
+        entry = library.query(token)  # → ClipEntry
     """
 
     def __init__(self, vq_vae: VQ_VAE, config: TrainingConfig):
         self.vq_vae  = vq_vae
         self.config  = config
         self._store: Dict[int, List[ClipEntry]] = defaultdict(list)
-        self._codebook_vecs: Optional[torch.Tensor] = None  # cached (codebook_size, emb_dim)
+        self._codebook_vecs: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Indexing
@@ -89,14 +79,9 @@ class StemLibrary:
                 continue
 
             for bar_idx in range(song.num_bars):
-                mel  = song.melody_clips_at(bar_idx)
-                harm = song.harmony_clips_at(bar_idx)
+                clips = song.clips_at(bar_idx)
 
-                vec = extract_bar_feature_vector(
-                    melody_clips  = mel  if mel  else None,
-                    harmony_clips = harm if harm else None,
-                    sr            = song.sr,
-                )
+                vec = extract_bar_feature_vector(clips, sr=song.sr)
 
                 with torch.no_grad():
                     vec_t   = torch.tensor(vec, dtype=torch.float32).unsqueeze(0).to(device)
@@ -105,15 +90,14 @@ class StemLibrary:
                 token = int(raw_tok) + self.config.num_special_tokens
 
                 self._store[token].append(ClipEntry(
-                    song_id       = song.song_id,
-                    bar_idx       = bar_idx,
-                    melody_clips  = mel,
-                    harmony_clips = harm,
-                    feature_vec   = vec,
-                    token         = token,
+                    song_id     = song.song_id,
+                    bar_idx     = bar_idx,
+                    clips       = clips,
+                    feature_vec = vec,
+                    token       = token,
                 ))
 
-        self._codebook_vecs = None  # invalidate cache after re-indexing
+        self._codebook_vecs = None
         print(f"StemLibrary: {self.total_clips} clips across {len(self.available_tokens)} token types")
 
     # ------------------------------------------------------------------
@@ -121,10 +105,7 @@ class StemLibrary:
     # ------------------------------------------------------------------
 
     def query(self, token: int) -> ClipEntry:
-        """
-        Return one clip entry for the given token.
-        Falls back to the nearest available token if the exact one is missing.
-        """
+        """Return one clip entry for the given token, with nearest-token fallback."""
         if token not in self._store:
             token = self._nearest_token(token)
         return random.choice(self._store[token])
@@ -140,13 +121,9 @@ class StemLibrary:
     # ------------------------------------------------------------------
 
     def _nearest_token(self, token: int) -> int:
-        """
-        Find the token in the library whose codebook vector is closest
-        (L2 distance in emb_dim space) to the requested token.
-        """
         codebook = self._get_codebook_vecs()
         raw_tok  = token - self.config.num_special_tokens
-        raw_tok  = max(0, min(raw_tok, codebook.shape[0] - 1))  # clamp
+        raw_tok  = max(0, min(raw_tok, codebook.shape[0] - 1))
         query_v  = codebook[raw_tok]
 
         best_token = None
@@ -163,7 +140,6 @@ class StemLibrary:
         return best_token
 
     def _get_codebook_vecs(self) -> torch.Tensor:
-        """Cached codebook vectors (codebook_size, emb_dim)."""
         if self._codebook_vecs is None:
             self._codebook_vecs = self.vq_vae.get_codebook_vectors().cpu()
         return self._codebook_vecs
@@ -181,5 +157,4 @@ class StemLibrary:
         return sum(len(v) for v in self._store.values())
 
     def token_counts(self) -> Dict[int, int]:
-        """Number of clips available per token."""
         return {tok: len(entries) for tok, entries in self._store.items()}

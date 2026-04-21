@@ -31,7 +31,7 @@ class VQ_VAE(nn.Module):
     ):
         """
         Args:
-            input_dim:      Feature vector size (25 = 12 mel chroma + 12 harm chroma + 1 onset)
+            input_dim:      Feature vector size (25 = 12 chroma + 6 spectral contrast + 4 MFCC + 1 onset + 1 RMS + 1 ZCR)
             hidden_dim:     MLP hidden layer width
             codebook_size:  Number of discrete codes (vocabulary size before special tokens)
             emb_dim:        Codebook entry dimensionality (latent bottleneck)

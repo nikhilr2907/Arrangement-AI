@@ -4,26 +4,22 @@ Convert local stem folders to HuggingFace parquet dataset.
 Expected folder structure:
   data/
     song_001/
-      melody.wav          ← required (at least one melody)
-      harmony_1.wav       ← optional
-      harmony_2.wav       ← optional
-      drums.wav           ← optional
-      bass.wav            ← optional
+      guitar.wav
+      bass.wav
+      drums.wav
+      synth.wav
       metadata.json       ← optional {"bpm": 120.0, "sr": 22050}
     song_002/
-      melody.wav
-      drums.wav
-      harmony_1.wav
+      vocals.wav
+      keys.wav
       metadata.json
     ...
 
-Stem type is inferred from filename:
-  "melody*"       → melody
-  "drum*", "kick*", "snare*", "perc*"  → drums
-  everything else → harmony
+Stem filenames can be anything — no melody/harmony classification needed.
+All audio files in a song folder become stems.
 
 Produces parquet with columns:
-  song_id | sr | bpm | <stem_name>_audio | <stem_name>_type | ...
+  song_id | sr | bpm | <stem_name>_audio | ...
 
 Stems missing for a song are stored as None (nullable).
 
@@ -40,95 +36,47 @@ import numpy as np
 import soundfile as sf
 from datasets import Dataset
 
+from src.audio_training_breakdown_automation.audio_breakdown import (
+    detect_beats,
+    find_drum_stem,
+)
 
-# ---------------------------------------------------------------------------
-# Stem type inference from filename
-# ---------------------------------------------------------------------------
-
-_MELODY_KEYWORDS  = {"melody", "vocal", "lead", "voice", "main", "singer", "vox"}
-_DRUMS_KEYWORDS   = {"drum", "kick", "snare", "perc", "cymbal", "hat", "clap", "beat"}
-_HARMONY_KEYWORDS = {"harmony", "bass", "synth", "pad", "chord", "guitar", "strings",
-                     "keys", "piano", "organ", "brass", "instrumental", "bgv", "backing"}
-
-
-def infer_stem_type(stem_name: str) -> str:
-    """
-    Infer melody / harmony / drums from stem filename.
-
-    Args:
-        stem_name: Stem file name without extension (e.g. "drums", "harmony_1")
-
-    Returns:
-        "melody", "harmony", or "drums"
-    """
-    name = stem_name.lower()
-
-    for keyword in _MELODY_KEYWORDS:
-        if keyword in name:
-            return "melody"
-
-    for keyword in _DRUMS_KEYWORDS:
-        if keyword in name:
-            return "drums"
-
-    for keyword in _HARMONY_KEYWORDS:
-        if keyword in name:
-            return "harmony"
-
-    return "harmony"  # safe default
-
-
-# ---------------------------------------------------------------------------
-# Audio loading
-# ---------------------------------------------------------------------------
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".aiff", ".aif"}
 
 
 def load_audio_mono(path: Path) -> tuple:
-    """
-    Load audio file as mono float32.
-
-    Returns:
-        (audio: np.ndarray, sr: int)
-    """
+    """Load audio file as mono float32. Returns (audio, sr)."""
     audio, sr = sf.read(str(path), dtype="float32", always_2d=True)
-    # Mix down to mono
     audio = np.mean(audio, axis=1)
     return audio.astype(np.float32), int(sr)
 
 
 def load_song_metadata(song_dir: Path, bpm_default: float) -> dict:
     """
-    Load BPM and SR from metadata.json if it exists.
+    Load song_id, BPM and SR from metadata.json if it exists.
 
-    metadata.json format:
-        {"bpm": 120.0, "sr": 22050}
-
-    Returns:
-        {"bpm": float, "sr": int or None}
+    metadata.json format: {"song_id": "my_song", "bpm": 120.0, "sr": 22050}
+    Falls back to folder name for song_id if not present in JSON.
     """
     meta_path = song_dir / "metadata.json"
     if meta_path.exists():
         with open(meta_path) as f:
             data = json.load(f)
         return {
-            "bpm": float(data.get("bpm", bpm_default)),
-            "sr": int(data["sr"]) if "sr" in data else None,
+            "song_id": data.get("song_id", song_dir.name),
+            "bpm":     float(data["bpm"]) if "bpm" in data else None,
+            "sr":      int(data["sr"]) if "sr" in data else None,
         }
-    return {"bpm": float(bpm_default), "sr": None}
+    return {"song_id": song_dir.name, "bpm": None, "sr": None}
 
-
-# ---------------------------------------------------------------------------
-# Dataset creation
-# ---------------------------------------------------------------------------
 
 def create_hf_dataset_from_stems(
     stem_root_dir: str,
-    output_repo: str,
-    bpm_default: float = 120.0,
-    private: bool = False,
-    split: str = "train",
+    output_repo:   str,
+    bpm_default:   float = 120.0,
+    private:       bool  = False,
+    split:         str   = "train",
 ):
     """
     Scan local stem folders and push to HuggingFace Hub as parquet dataset.
@@ -147,95 +95,90 @@ def create_hf_dataset_from_stems(
     # Pass 1: collect all rows and discover all unique stem names
     # ------------------------------------------------------------------
 
-    raw_rows = []
+    raw_rows       = []
     all_stem_names = set()
 
     for song_dir in sorted(stem_root.iterdir()):
         if not song_dir.is_dir():
             continue
 
-        song_id = song_dir.name
-        meta = load_song_metadata(song_dir, bpm_default)
+        meta    = load_song_metadata(song_dir, bpm_default)
+        song_id = meta["song_id"]
 
-        # Find all audio files in this song folder
         audio_files = sorted(
             f for f in song_dir.iterdir()
             if f.suffix.lower() in AUDIO_EXTENSIONS
+            and not f.stem.endswith(("_Master", "_Current"))
         )
 
         if not audio_files:
-            print(f"  ⚠ Skipping {song_id}: no audio files found")
+            print(f"  WARNING: Skipping {song_id}: no audio files found")
             continue
 
-        song_stems = {}  # stem_name → audio bytes
+        song_stems       = {}
+        song_stems_numpy = {}
 
         for audio_path in audio_files:
-            stem_name = audio_path.stem  # filename without extension
+            stem_name = audio_path.stem
 
             try:
                 audio, file_sr = load_audio_mono(audio_path)
 
-                # Use file's SR if not in metadata
                 if meta["sr"] is None:
                     meta["sr"] = file_sr
 
-                song_stems[stem_name] = audio.tobytes()
+                song_stems_numpy[stem_name] = audio
+                song_stems[stem_name]       = audio.tobytes()
                 all_stem_names.add(stem_name)
-                print(f"  ✓ {song_id}/{stem_name}.{audio_path.suffix.lstrip('.')} "
-                      f"({len(audio)} samples, SR={file_sr})")
+                print(f"  OK {song_id}/{stem_name} ({len(audio)} samples, SR={file_sr})")
 
             except Exception as e:
-                print(f"  ✗ {song_id}/{audio_path.name}: {e}")
+                print(f"  FAIL {song_id}/{audio_path.name}: {e}")
 
-        # Skip songs with no stems loaded
         if not song_stems:
-            print(f"  ⚠ Skipping {song_id}: all stems failed to load")
+            print(f"  WARNING: Skipping {song_id}: all stems failed to load")
             continue
 
-        # Check at least one melody stem exists
-        melody_stems = [k for k in song_stems if infer_stem_type(k) == "melody"]
-        if not melody_stems:
-            print(f"  ⚠ Skipping {song_id}: no melody stem detected "
-                  f"(stems: {list(song_stems.keys())})")
-            continue
+        if meta["bpm"] is None:
+            sr = meta["sr"] or 22050
+            try:
+                drum_name, drum_audio = find_drum_stem(song_stems_numpy, sr)
+                detected_tempo, _     = detect_beats(drum_audio, sr)
+                meta["bpm"]           = float(np.squeeze(detected_tempo))
+                print(f"  BPM auto-detected from '{drum_name}': {meta['bpm']:.1f}")
+            except Exception as e:
+                meta["bpm"] = float(bpm_default)
+                print(f"  WARNING: BPM detection failed ({e}), using default {bpm_default}")
 
         raw_rows.append({
             "song_id": song_id,
-            "sr": meta["sr"] or 22050,
-            "bpm": meta["bpm"],
-            "stems": song_stems,
+            "sr":      meta["sr"] or 22050,
+            "bpm":     meta["bpm"],
+            "stems":   song_stems,
         })
 
     if not raw_rows:
         print("\nERROR: No valid songs found. Check folder structure.")
         return
 
-    print(f"\nFound {len(raw_rows)} valid songs")
+    print(f"\nFound {len(raw_rows)} songs")
     print(f"Unique stem names: {sorted(all_stem_names)}\n")
 
     # ------------------------------------------------------------------
     # Pass 2: build flat rows — one column per stem (None if absent)
     # ------------------------------------------------------------------
-    # Columns: song_id, sr, bpm,
-    #          <stem>_audio (bytes or None), <stem>_type (str or None)
-    #          for each stem in all_stem_names
 
-    all_stem_names = sorted(all_stem_names)  # stable ordering
+    all_stem_names = sorted(all_stem_names)
 
     flat_rows = []
     for raw in raw_rows:
         row = {
             "song_id": raw["song_id"],
-            "sr": raw["sr"],
-            "bpm": raw["bpm"],
+            "sr":      raw["sr"],
+            "bpm":     raw["bpm"],
         }
         for stem_name in all_stem_names:
-            if stem_name in raw["stems"]:
-                row[f"{stem_name}_audio"] = raw["stems"][stem_name]
-                row[f"{stem_name}_type"]  = infer_stem_type(stem_name)
-            else:
-                row[f"{stem_name}_audio"] = None
-                row[f"{stem_name}_type"]  = None
+            row[f"{stem_name}_audio"] = raw["stems"].get(stem_name, None)
 
         flat_rows.append(row)
 
@@ -247,19 +190,15 @@ def create_hf_dataset_from_stems(
           f"{len(all_stem_names)} stem columns)...")
 
     dataset_dict = {k: [r[k] for r in flat_rows] for k in flat_rows[0]}
-    dataset = Dataset.from_dict(dataset_dict)
+    dataset      = Dataset.from_dict(dataset_dict)
 
     print(f"[2/2] Pushing to {output_repo} (split={split}, private={private})...")
     dataset.push_to_hub(output_repo, split=split, private=private)
 
-    print(f"\n✓ Done!")
+    print(f"\nDone.")
     print(f"Dataset: https://huggingface.co/datasets/{output_repo}")
     print(f"Columns: {list(dataset.column_names)}")
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -294,9 +233,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     create_hf_dataset_from_stems(
-        stem_root_dir=args.stem_root,
-        output_repo=args.repo,
-        bpm_default=args.bpm,
-        private=args.private,
-        split=args.split,
+        stem_root_dir = args.stem_root,
+        output_repo   = args.repo,
+        bpm_default   = args.bpm,
+        private       = args.private,
+        split         = args.split,
     )

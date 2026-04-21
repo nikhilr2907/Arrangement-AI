@@ -1,111 +1,96 @@
 """
 Feature extraction from bar-level audio clips.
 
-Two entry points:
-    extract_feature_matrix()    → (25, T_frames)  full time-series, used internally
-    extract_bar_feature_vector() → (25,)           mean-pooled, used for VQ-VAE training
+Entry points:
+    extract_bar_feature_vector() → (25,)  mean-pooled, used for VQ-VAE training
+
+Feature layout (25 dims, no melody/harmony split needed):
+    0–11   chroma_cens        (12)  pitch-class content, HPSS harmonic component
+    12–17  spectral_contrast  ( 6)  texture / fullness across frequency bands
+    18–21  MFCC 1–4           ( 4)  coarse timbral shape
+    22     onset_strength     ( 1)  rhythmic density
+    23     RMS                ( 1)  energy / dynamics
+    24     ZCR                ( 1)  noisiness / percussiveness
 """
 
-from typing import List, Optional
+from typing import List
 
 import librosa
 import numpy as np
 
 
-def extract_feature_matrix(
-    main_melody: Optional[np.ndarray] = None,
-    harmonic_clips: Optional[np.ndarray] = None,
-    sr: int = 22050,
-) -> np.ndarray:
-    """
-    Extracts the combined time-series feature matrix for a bar.
-
-    Args:
-        main_melody:    Array of audio arrays for leading melody clips
-        harmonic_clips: Array of audio arrays for harmony parts
-        sr:             Sample rate
-
-    Returns:
-        (25, T_frames) numpy array
-        Rows: 12 melody chroma + 12 harmony chroma + 1 rhythmic density
-    """
-    has_melody  = main_melody is not None and len(main_melody) > 0
-    has_harmony = harmonic_clips is not None and len(harmonic_clips) > 0
-
-    if not has_melody and not has_harmony:
-        raise ValueError("At least one of main_melody or harmonic_clips must be provided.")
-
-    n_fft      = 2048
-    hop_length = 512
-
-    # --- Melody chroma (12 dim) ---
-    melody_chroma_matrices = []
-    melody_signals = []
-    if has_melody:
-        for y_melody in main_melody:
-            y_melody = np.array(y_melody, dtype=np.float32)
-            y_harm   = librosa.effects.hpss(y_melody, margin=3.0, kernel_size=n_fft)[0]
-            chroma   = librosa.feature.chroma_cens(y=y_harm, sr=sr, hop_length=hop_length)
-            melody_chroma_matrices.append(chroma)
-            melody_signals.append(y_melody)
-
-    # --- Harmony chroma (12 dim) ---
-    harmony_chroma_matrices = []
-    harmony_signals = []
-    if has_harmony:
-        for y_clip in harmonic_clips:
-            y_clip = np.array(y_clip, dtype=np.float32)
-            y_harm = librosa.effects.hpss(y_clip, margin=3.0, kernel_size=n_fft)[0]
-            chroma = librosa.feature.chroma_cens(y=y_harm, sr=sr, hop_length=hop_length)
-            harmony_chroma_matrices.append(chroma)
-            harmony_signals.append(y_clip)
-
-    # Align frame counts
-    all_chromas = melody_chroma_matrices + harmony_chroma_matrices
-    min_frames  = min(m.shape[1] for m in all_chromas)
-
-    chroma_mel  = (
-        np.mean([m[:, :min_frames] for m in melody_chroma_matrices], axis=0)
-        if has_melody else np.zeros((12, min_frames))
-    )
-    chroma_harm = (
-        np.mean([m[:, :min_frames] for m in harmony_chroma_matrices], axis=0)
-        if has_harmony else np.zeros((12, min_frames))
-    )
-
-    # --- Rhythmic density (1 dim) ---
-    all_signals     = melody_signals + harmony_signals
-    min_len         = min(s.shape[0] for s in all_signals)
-    y_mix           = np.sum([s[:min_len] for s in all_signals], axis=0)
-    onset_env       = librosa.onset.onset_strength(y=y_mix, sr=sr, hop_length=hop_length)
-    rhythm_matrix   = onset_env[:min_frames][np.newaxis, :]
-
-    return np.vstack([chroma_mel, chroma_harm, rhythm_matrix])  # (25, T_frames)
-
-
 def extract_bar_feature_vector(
-    melody_clips: Optional[List[np.ndarray]],
-    harmony_clips: Optional[List[np.ndarray]],
+    clips: List[np.ndarray],
     sr: int = 22050,
 ) -> np.ndarray:
     """
     Extract a single 25-dim feature vector for one bar position.
 
-    Mean-pools the time-series matrix along the frame axis so the result
-    is a fixed-size descriptor regardless of bar length. This is the input
-    format expected by the VQ-VAE encoder.
+    Mixes all stem clips together, then computes features on the mix.
+    Per-clip chroma is averaged before mixing to avoid louder stems dominating
+    the pitch content.
 
     Args:
-        melody_clips:   List of bar-length audio arrays for melody stems
-        harmony_clips:  List of bar-length audio arrays for harmony stems
-        sr:             Sample rate
+        clips: List of bar-length audio arrays (one per stem, any number)
+        sr:    Sample rate
 
     Returns:
         (25,) float32 numpy array
     """
-    matrix = extract_feature_matrix(
-        main_melody    = np.array(melody_clips,  dtype=object) if melody_clips  else None,
-        harmonic_clips = np.array(harmony_clips, dtype=object) if harmony_clips else None,
-        sr             = sr,
-    )
-    return matrix.mean(axis=1).astype(np.float32)  # (25, T) → (25,)
+    if not clips:
+        return np.zeros(25, dtype=np.float32)
+
+    n_fft      = 2048
+    hop_length = 512
+
+    # Align all clips to the same length
+    min_len = min(len(c) for c in clips)
+    aligned = [np.array(c[:min_len], dtype=np.float32) for c in clips]
+
+    # Mixed signal for onset / RMS / ZCR (sum then normalise)
+    mix = np.sum(aligned, axis=0)
+    peak = np.abs(mix).max()
+    if peak > 0:
+        mix = mix / peak
+
+    # --- Chroma (12 dims): average per-clip HPSS chroma, then mean over time ---
+    chroma_matrices = []
+    for y in aligned:
+        y_harm = librosa.effects.hpss(y, margin=3.0, kernel_size=n_fft)[0]
+        chroma = librosa.feature.chroma_cens(y=y_harm, sr=sr, hop_length=hop_length)
+        chroma_matrices.append(chroma)
+
+    min_frames  = min(m.shape[1] for m in chroma_matrices)
+    chroma_mean = np.mean([m[:, :min_frames] for m in chroma_matrices], axis=0)  # (12, T)
+    feat_chroma = chroma_mean.mean(axis=1)  # (12,)
+
+    # --- Spectral contrast (6 dims): 5 sub-bands + 1 ---
+    contrast = librosa.feature.spectral_contrast(
+        y=mix, sr=sr, hop_length=hop_length, n_bands=5
+    )  # (6, T)
+    feat_contrast = contrast.mean(axis=1)  # (6,)
+
+    # --- MFCC 1–4 (4 dims) ---
+    mfcc = librosa.feature.mfcc(y=mix, sr=sr, n_mfcc=4, hop_length=hop_length)  # (4, T)
+    feat_mfcc = mfcc.mean(axis=1)  # (4,)
+
+    # --- Onset strength (1 dim) ---
+    onset_env   = librosa.onset.onset_strength(y=mix, sr=sr, hop_length=hop_length)
+    feat_onset  = np.array([onset_env.mean()], dtype=np.float32)
+
+    # --- RMS (1 dim) ---
+    rms        = librosa.feature.rms(y=mix, hop_length=hop_length)
+    feat_rms   = np.array([rms.mean()], dtype=np.float32)
+
+    # --- ZCR (1 dim) ---
+    zcr        = librosa.feature.zero_crossing_rate(y=mix, hop_length=hop_length)
+    feat_zcr   = np.array([zcr.mean()], dtype=np.float32)
+
+    return np.concatenate([
+        feat_chroma,    # 12
+        feat_contrast,  # 6
+        feat_mfcc,      # 4
+        feat_onset,     # 1
+        feat_rms,       # 1
+        feat_zcr,       # 1
+    ]).astype(np.float32)  # (25,)

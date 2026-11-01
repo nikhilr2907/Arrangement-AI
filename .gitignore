@@ -5,3 +5,13 @@
 .claude*
 /test_notebooks/
 docs/
+.runtime/
+.cache/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/data/
+/checkpoints/
+/runs/
+*.egg-info/

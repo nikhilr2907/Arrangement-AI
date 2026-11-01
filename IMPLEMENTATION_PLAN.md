@@ -1,5 +1,7 @@
 # Stem-by-stem arrangement: implementation and refactor specification
 
+> Historical bar-level baseline specification. The implemented within-bar, four-context architecture and its implementation sequence are documented in [README.md](README.md#model-and-agreed-context-plan). That plan supersedes this document's bar-only timing and history-encoding choices.
+
 Status: planning only. Updated 2026-10-14. No model implementation is changed by this document.
 
 This document supersedes the earlier design in `docs/ARCHITECTURE_REFACTOR_PLAN.md` where the two disagree. It incorporates variable-length clips, per-channel playback, bar-aligned crops and repeats, and the binary change gate with conditional destination scoring.

@@ -6,7 +6,7 @@ import soundfile as sf
 from scipy.signal import resample_poly
 
 from src.contracts import ArrangementResult, Modality
-from src.timing import bar_seconds, source_audio_seconds, tick_to_seconds
+from src.timing import source_step_seconds, step_tick, tick_to_seconds
 
 
 def render_audio(
@@ -37,15 +37,21 @@ def render_audio(
         for placement in result.placements:
             if placement.channel_id != channel.channel_id:
                 continue
+            steps = result.request.steps_per_bar
+            source_step = placement.source_start_bar * steps + placement.source_start_phase
+            destination_step = (
+                placement.destination_start_bar * steps + placement.destination_start_phase
+            )
             source_spans = [
-                source_audio_seconds(channel.clip, source_bar)
-                for source_bar in range(
-                    placement.source_start_bar, placement.source_start_bar + placement.bar_count
-                )
+                source_step_seconds(channel.clip, source, steps)
+                for source in range(source_step, source_step + placement.length_steps)
             ]
-            destination, _ = bar_seconds(placement.destination_start_bar, result.request.grid)
-            _, target_end = bar_seconds(
-                placement.destination_start_bar + placement.bar_count - 1, result.request.grid
+            destination = tick_to_seconds(
+                step_tick(result.request.grid, destination_step, steps), result.request.grid
+            )
+            target_end = tick_to_seconds(
+                step_tick(result.request.grid, destination_step + placement.length_steps, steps),
+                result.request.grid,
             )
             if abs(sum(b - a for a, b in source_spans) - (target_end - destination)) > 0.002:
                 raise ValueError("Audio placement requires time stretching; no implicit adaptation")

@@ -11,12 +11,21 @@ class ModelInputs:
     feature_midi: Tensor
     feature_audio: Tensor
     feature_meta: Tensor
+    resolution: Tensor
     history_global: Tensor
     history_channel_valid: Tensor
-    history_target: Tensor
     history_valid: Tensor
+    history_meta: Tensor
+    history_roles: Tensor
+    playback_tokens: Tensor
+    playback_destination: Tensor
+    playback_source: Tensor
+    playback_valid: Tensor
+    source: Tensor
+    source_valid: Tensor
     current: Tensor
     current_status: Tensor
+    current_roles: Tensor
     current_valid: Tensor
     keep: Tensor
     query_meta: Tensor

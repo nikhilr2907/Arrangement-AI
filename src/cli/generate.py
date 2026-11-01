@@ -32,7 +32,7 @@ def main() -> None:
     result = ArrangementGenerator(model, inventory).generate(request, args.sample, args.temperature)
     write_json(
         args.output / "arrangement.json",
-        {"schema_version": 1, "checkpoint": str(args.checkpoint.resolve()), "result": result},
+        {"schema_version": 2, "checkpoint": str(args.checkpoint.resolve()), "result": result},
     )
     export_midi(result, args.output / "arrangement.mid")
     if args.render_audio:

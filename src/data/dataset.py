@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from torch.utils.data import Dataset
 
 from src.contracts import (
+    ActionKind,
     ArrangementRequest,
     BarPlayback,
     PlaybackAction,
@@ -26,6 +27,7 @@ class DecisionExample:
     history: tuple[tuple[BarPlayback, ...], ...]
     committed: tuple[BarPlayback, ...]
     target: PlaybackAction | None = None
+    phase: int = 0
 
 
 def replay(
@@ -35,10 +37,11 @@ def replay(
     states = tuple(PlaybackState() for _ in episode.request.channels)
     snapshots: list[tuple[PlaybackState, ...]] = []
     history: list[tuple[BarPlayback, ...]] = []
-    for bar, actions in enumerate(episode.actions):
+    for step, actions in enumerate(episode.actions):
+        bar, phase = divmod(step, episode.request.steps_per_bar)
         snapshots.append(states)
         transitions = [
-            machine.apply(state, action, channel, episode.request, bar)
+            machine.apply(state, action, channel, episode.request, bar, phase=phase)
             for state, action, channel in zip(
                 states, actions, episode.request.channels, strict=True
             )
@@ -110,17 +113,41 @@ class ArrangementDecisionDataset(Dataset[DecisionExample]):
             )
             episode = replace(episode, request=replace(episode.request, channels=mixed_channels))
         count = len(episode.request.channels)
-        bar, order_index = divmod(offset, count)
+        step, order_index = divmod(offset, count)
+        steps = episode.request.steps_per_bar
+        bar, phase = divmod(step, steps)
         order = list(range(count))
-        random.Random(f"{self.seed}:{self.epoch}:{episode.episode_id}:{bar}").shuffle(order)
+        random.Random(f"{self.seed}:{self.epoch}:{episode.episode_id}:{step}").shuffle(order)
         channel = order[order_index]
         states, playback = self._replay(episode_index)
         return DecisionExample(
             episode.request,
             bar,
             channel,
-            states[bar],
-            playback[max(0, bar - self.history_bars) : bar],
-            tuple(playback[bar][i] for i in order[:order_index]),
-            episode.actions[bar][channel],
+            states[step],
+            playback[max(0, bar - self.history_bars) * steps : step],
+            tuple(playback[step][i] for i in order[:order_index]),
+            episode.actions[step][channel],
+            phase,
         )
+
+
+def refine_episode(episode: PreparedEpisode, steps_per_bar: int) -> PreparedEpisode:
+    """Expand coarse actions without inventing edits between observed boundaries."""
+    previous = episode.request.steps_per_bar
+    if steps_per_bar < previous or steps_per_bar % previous:
+        raise ValueError("New resolution must be an integer refinement of the existing grid")
+    factor = steps_per_bar // previous
+    actions: list[tuple[PlaybackAction, ...]] = []
+    for row in episode.actions:
+        actions.append(
+            tuple(replace(action, source_phase=action.source_phase * factor) for action in row)
+        )
+        actions.extend(
+            tuple(PlaybackAction(ActionKind.KEEP) for _ in row) for _ in range(factor - 1)
+        )
+    return replace(
+        episode,
+        request=replace(episode.request, steps_per_bar=steps_per_bar),
+        actions=tuple(actions),
+    )

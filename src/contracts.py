@@ -135,22 +135,28 @@ class Channel:
 class PlaybackAction:
     kind: ActionKind
     source_bar: int | None = None
+    source_phase: int = 0
 
     def __post_init__(self) -> None:
         if self.kind == ActionKind.START:
             if self.source_bar is None or self.source_bar < 0:
                 raise ValueError("START requires a nonnegative source bar")
-        elif self.source_bar is not None:
+        elif self.source_bar is not None or self.source_phase:
             raise ValueError("Only START has a source position")
+        if self.source_phase < 0:
+            raise ValueError("Source phase cannot be negative")
 
 
 @dataclass(frozen=True)
 class PlaybackState:
     next_source_bar: int | None = None
+    next_source_phase: int = 0
 
     def __post_init__(self) -> None:
         if self.next_source_bar is not None and self.next_source_bar < 0:
             raise ValueError("Playback cursors cannot be negative")
+        if self.next_source_phase < 0 or (self.next_source_bar is None and self.next_source_phase):
+            raise ValueError("Invalid source phase")
 
 
 @dataclass(frozen=True)
@@ -160,6 +166,9 @@ class BarPlayback:
     source_bar: int | None
     action: PlaybackAction
     probability: float = 1.0
+    destination_phase: int = 0
+    source_phase: int = 0
+    steps_per_bar: int = 1
 
 
 @dataclass(frozen=True)
@@ -168,6 +177,16 @@ class Placement:
     source_start_bar: int
     destination_start_bar: int
     bar_count: int
+    source_start_phase: int = 0
+    destination_start_phase: int = 0
+    steps_per_bar: int = 1
+    step_count: int | None = None
+
+    @property
+    def length_steps(self) -> int:
+        return (
+            self.step_count if self.step_count is not None else self.bar_count * self.steps_per_bar
+        )
 
 
 @dataclass(frozen=True)
@@ -175,11 +194,17 @@ class ArrangementRequest:
     channels: tuple[Channel, ...]
     grid: MusicalGrid
     seed: int = 0
+    steps_per_bar: int = 1
 
     def __post_init__(self) -> None:
         ids = [channel.channel_id for channel in self.channels]
         if not ids or len(ids) != len(set(ids)):
             raise ValueError("An arrangement requires uniquely named channels")
+        if self.steps_per_bar < 1:
+            raise ValueError("steps_per_bar must be positive")
+        for grid in (self.grid, *(channel.clip.grid for channel in self.channels)):
+            if any((bar.end - bar.start) % self.steps_per_bar for bar in grid.bars):
+                raise ValueError("Decision steps must be exactly representable in musical ticks")
 
 
 @dataclass(frozen=True)
@@ -194,10 +219,16 @@ class PreparedEpisode:
     def __post_init__(self) -> None:
         if self.split not in {"train", "validation", "test"}:
             raise ValueError("Unknown dataset split")
-        if len(self.actions) != len(self.request.grid.bars):
-            raise ValueError("Action rows must match destination bars")
+        if len(self.actions) != len(self.request.grid.bars) * self.request.steps_per_bar:
+            raise ValueError("Action rows must match destination decision steps")
         if any(len(row) != len(self.request.channels) for row in self.actions):
             raise ValueError("Each action row must cover all channels")
+        if any(
+            action.source_phase >= self.request.steps_per_bar
+            for row in self.actions
+            for action in row
+        ):
+            raise ValueError("Action source phase is outside the decision grid")
 
 
 @dataclass(frozen=True)

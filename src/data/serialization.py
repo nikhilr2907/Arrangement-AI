@@ -123,7 +123,10 @@ def request_from_dict(value: object, base: Path) -> ArrangementRequest:
             )
         )
     return ArrangementRequest(
-        tuple(channels), grid_from_dict(data["grid"]), integer(data.get("seed", 0))
+        tuple(channels),
+        grid_from_dict(data["grid"]),
+        integer(data.get("seed", 0)),
+        integer(data.get("steps_per_bar", 1)),
     )
 
 
@@ -136,6 +139,7 @@ def episode_from_dict(value: object, base: Path) -> PreparedEpisode:
                 integer(mapping(action)["source_bar"])
                 if mapping(action).get("source_bar") is not None
                 else None,
+                integer(mapping(action).get("source_phase", 0)),
             )
             for action in sequence(row)
         )

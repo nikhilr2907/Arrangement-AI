@@ -16,7 +16,7 @@ from src.data.serialization import mapping
 from src.features.cache import ExtractorSpec
 from src.models.arrangement import ArrangementModel
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def validate_extractors(payload: dict[str, object], specs: Mapping[str, ExtractorSpec]) -> None:
@@ -80,7 +80,9 @@ def save_checkpoint(
 def load_checkpoint(path: Path, device: torch.device) -> tuple[ArrangementModel, dict[str, object]]:
     payload = mapping(torch.load(path, map_location="cpu", weights_only=True))
     if payload.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("Incompatible checkpoint; legacy whole-bundle models require retraining")
+        raise ValueError(
+            "Incompatible checkpoint; the step-context architecture requires retraining"
+        )
     raw_config = mapping(payload["model_config"])
     config = model_config_from_dict(raw_config)
     model = ArrangementModel(config).to(device)

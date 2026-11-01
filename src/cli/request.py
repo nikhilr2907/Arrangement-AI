@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("--audio", type=Path, action="append", default=[])
     parser.add_argument("--bpm", type=float, required=True)
     parser.add_argument("--bars", type=int, required=True)
+    parser.add_argument("--steps-per-bar", type=int, default=16)
     parser.add_argument("--numerator", type=int, default=4)
     parser.add_argument("--denominator", type=int, default=4)
     parser.add_argument("--audio-starts-on-downbeat", action="store_true")
@@ -47,7 +48,9 @@ def main() -> None:
             f"audio_{file_index}", regular_grid(bars, args.bpm, meter), audio_path=path.resolve()
         )
         channels.append(Channel(f"audio_{file_index}", clip, Modality.AUDIO))
-    write_json(args.output, ArrangementRequest(tuple(channels), target, args.seed))
+    write_json(
+        args.output, ArrangementRequest(tuple(channels), target, args.seed, args.steps_per_bar)
+    )
 
 
 if __name__ == "__main__":

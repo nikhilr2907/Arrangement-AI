@@ -4,6 +4,7 @@ import mido
 
 from src.contracts import ArrangementResult, Modality
 from src.data.midi import crop_controllers
+from src.timing import step_tick
 
 
 def export_midi(result: ArrangementResult, path: Path) -> None:
@@ -52,9 +53,14 @@ def export_midi(result: ArrangementResult, path: Path) -> None:
         for placement in result.placements:
             if placement.channel_id != channel.channel_id:
                 continue
-            start = clip.grid.bars[placement.source_start_bar].start
-            end = clip.grid.bars[placement.source_start_bar + placement.bar_count - 1].end
-            target = request.grid.bars[placement.destination_start_bar].start
+            steps = request.steps_per_bar
+            source_step = placement.source_start_bar * steps + placement.source_start_phase
+            destination_step = (
+                placement.destination_start_bar * steps + placement.destination_start_phase
+            )
+            start = step_tick(clip.grid, source_step, steps)
+            end = step_tick(clip.grid, source_step + placement.length_steps, steps)
+            target = step_tick(request.grid, destination_step, steps)
             controls.extend(
                 (event.tick, 2, event.control, event.value)
                 for event in crop_controllers(

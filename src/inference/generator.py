@@ -42,7 +42,8 @@ class ArrangementGenerator:
         history: list[tuple[BarPlayback, ...]] = []
         self.model.eval()
         with torch.inference_mode():
-            for bar in range(len(request.grid.bars)):
+            for step in range(len(request.grid.bars) * request.steps_per_bar):
+                bar, phase = divmod(step, request.steps_per_bar)
                 order = list(range(len(request.channels)))
                 order_rng.shuffle(order)
                 committed: dict[int, BarPlayback] = {}
@@ -53,8 +54,14 @@ class ArrangementGenerator:
                         bar,
                         index,
                         before,
-                        tuple(history[-self.model.config.history_bars :]),
+                        tuple(
+                            history[
+                                max(0, bar - self.model.config.history_bars)
+                                * request.steps_per_bar :
+                            ]
+                        ),
                         tuple(committed.values()),
+                        phase=phase,
                     )
                     inputs = self.collate([example]).inputs.to(device)
                     logits = self.model(inputs)
@@ -67,7 +74,7 @@ class ArrangementGenerator:
                     else:
                         choice = int(log_probs.argmax().item())
                     candidates = build_candidates(
-                        before[index], request.channels[index], request, bar
+                        before[index], request.channels[index], request, bar, phase
                     )
                     action = (
                         PlaybackAction(ActionKind.KEEP) if choice == 0 else candidates[choice - 1]
@@ -79,6 +86,7 @@ class ArrangementGenerator:
                         request,
                         bar,
                         float(log_probs[choice].exp().item()),
+                        phase,
                     )
                 history.append(tuple(committed[index] for index in range(len(request.channels))))
         playback = tuple(history)
